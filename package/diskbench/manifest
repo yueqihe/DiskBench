@@ -1,0 +1,17 @@
+appname=diskbench
+version=0.1.17
+display_name=Disk Bench
+desc=fnOS 硬盘健康检测与性能测试工具，支持 SMART、坏道扫描及文件/底层读写测速。
+source=thirdparty
+maintainer=情深深雨蒙蒙
+maintainer_url=https://club.fnnas.com/home.php?mod=space&uid=1401&do=profile&from=space
+distributor=情深深雨蒙蒙
+distributor_url=https://club.fnnas.com/home.php?mod=space&uid=1401&do=profile&from=space
+platform=arm
+desktop_uidir=ui
+desktop_applaunchname=diskbench.main
+os_min_version=1.1.3100
+ctl_stop=true
+checkport=false
+disable_authorization_path=true
+changelog=新增原始 SMART 信息查看弹窗，优化快速抽样、异常定位与慢响应复核，完善扫描定位默认配置及窗口显示。

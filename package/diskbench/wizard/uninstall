@@ -1,0 +1,37 @@
+[
+  {
+    "stepTitle": "卸载 Disk Bench",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "卸载会停止正在运行的检测任务。请选择如何处理扫描、测速历史和完整异常地址明细。"
+      },
+      {
+        "type": "radio",
+        "field": "wizard_history_action",
+        "label": "历史记录",
+        "initValue": "keep",
+        "options": [
+          {
+            "label": "保留记录（保留在原目录，重装后继续查看）",
+            "value": "keep"
+          },
+          {
+            "label": "删除记录（删除检测历史与完整异常明细，无法恢复）",
+            "value": "delete"
+          }
+        ],
+        "rules": [
+          {
+            "required": true,
+            "message": "请选择保留或删除历史记录。"
+          }
+        ]
+      },
+      {
+        "type": "tips",
+        "helpText": "此选项只处理 Disk Bench 的检测记录，不会删除硬盘上的个人文件。"
+      }
+    ]
+  }
+]

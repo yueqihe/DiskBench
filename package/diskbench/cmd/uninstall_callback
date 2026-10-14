@@ -1,0 +1,44 @@
+#!/bin/bash
+
+uninstall_error() {
+  printf '%s\n' "$1" >&2
+  [ -z "${TRIM_TEMP_LOGFILE:-}" ] || printf '%s\n' "$1" > "$TRIM_TEMP_LOGFILE"
+  return 1
+}
+
+# fnOS removes target/tmp/home/etc but retains var and shares. Keep history in
+# its original TRIM_PKGVAR/jobs location unless deletion is explicitly chosen.
+case "${wizard_history_action:-keep}" in
+  keep)
+    printf '%s\n' "Disk Bench 已卸载，历史记录保留在原数据目录，重装后可继续查看。"
+    exit 0
+    ;;
+  delete) ;;
+  *) uninstall_error "请选择保留或删除历史记录。"; exit 1 ;;
+esac
+
+case "${TRIM_PKGVAR:-}" in
+  /*) ;;
+  *) uninstall_error "应用数据目录无效，已停止历史记录清理。"; exit 1 ;;
+esac
+data_dir="$(realpath -m -- "$TRIM_PKGVAR")" || exit 1
+case "$data_dir" in
+  */@appdata/diskbench) ;;
+  *) uninstall_error "应用数据目录无效，已停止历史记录清理。"; exit 1 ;;
+esac
+jobs_dir="$data_dir/jobs"
+# Clean up only the duplicate created by 0.1.10, if that package was used.
+# New versions never create this directory or restore anything from it.
+legacy_backup="${data_dir%/diskbench}/.diskbench-history"
+for directory in "$jobs_dir" "$legacy_backup"; do
+  if [ -L "$directory" ] || { [ -e "$directory" ] && [ ! -d "$directory" ]; }; then
+    uninstall_error "历史记录目录无效，已停止清理，原文件仍保留。"
+    exit 1
+  fi
+done
+if ! rm -rf -- "$jobs_dir" "$legacy_backup"; then
+  uninstall_error "历史记录删除失败，请检查目录权限后重试。"
+  exit 1
+fi
+printf '%s\n' "Disk Bench 已卸载，检测历史及完整异常明细已删除。"
+exit 0

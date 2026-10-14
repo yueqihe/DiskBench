@@ -1,0 +1,4 @@
+package/diskbench/cmd/* text eol=lf
+package/diskbench/wizard/* text eol=lf
+runtime-deps/*/bin/fio text eol=lf
+runtime-deps/*/bin/smartctl text eol=lf

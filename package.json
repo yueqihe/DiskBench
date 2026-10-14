@@ -1,0 +1,25 @@
+{
+  "name": "diskbench",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "frontend"
+  ],
+  "scripts": {
+    "dev": "npm --workspace frontend run dev",
+    "build:frontend": "npm --workspace frontend run build",
+    "build:icons": "node scripts/render-icons.js",
+    "build:go": "node scripts/build-go.js",
+    "stage": "node scripts/stage.js",
+    "build": "npm run build:icons && npm run build:frontend && npm run build:go && npm run stage",
+    "fpk:amd64": "npm run build:icons && npm run build:frontend && cross-env GOOS=linux GOARCH=amd64 node scripts/build-go.js && node scripts/set-platform.js x86 && cross-env TARGET_ARCH=amd64 npm run stage && node scripts/fnpack.js build --directory package/diskbench",
+    "fpk:arm64": "npm run build:icons && npm run build:frontend && cross-env GOOS=linux GOARCH=arm64 node scripts/build-go.js && node scripts/set-platform.js arm && cross-env TARGET_ARCH=arm64 npm run stage && node scripts/fnpack.js build --directory package/diskbench",
+    "fpk": "npm run fpk:amd64",
+    "serve": "npm run build:frontend && npm run build:go && cross-env LOCAL_DEV=1 PORT=5050 FRONTEND_DIST=../frontend/dist DATA_DIR=../.local-data node scripts/run-backend.js",
+    "demo": "npm run build:frontend && npm run build:go && cross-env LOCAL_DEV=1 MOCK_DEV=1 PORT=5050 FRONTEND_DIST=../frontend/dist DATA_DIR=../.local-data node scripts/run-backend.js",
+    "test": "node --test backend/test/*.test.js && node scripts/test-go.js"
+  },
+  "devDependencies": {
+    "cross-env": "^7.0.3"
+  }
+}

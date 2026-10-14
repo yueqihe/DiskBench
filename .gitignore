@@ -1,0 +1,37 @@
+node_modules/
+frontend/dist/
+dist/
+.local-data/
+.security-test-data/
+*.fpk
+*.log
+.DS_Store
+
+# Go toolchain and build artifacts
+.tools/
+backend/diskbench
+backend/diskbench.exe
+backend/diskscan.exe
+backend/fn-diskscan
+backend/fn-diskscan.exe
+
+# Generated package contents and local previews
+/package/diskbench/app/server/
+/app.tgz
+/.local-*
+/.edge-*/
+/.theme-*/
+/.fnos-*.png
+/theme-dark-preview.png
+
+# Local credentials and reference material
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+/.ssh/
+/DG/
+/HD/
+/analysis/
+/references/

@@ -1,0 +1,4 @@
+#!/bin/bash
+# fnOS preserves TRIM_PKGVAR on uninstall. JobManager reads its existing jobs
+# directory directly on startup; reinstall does not copy or restore records.
+exit 0

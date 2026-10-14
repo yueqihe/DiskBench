@@ -1,0 +1,4 @@
+#!/bin/sh
+BIN_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+RUNTIME_DIR="$(dirname -- "$BIN_DIR")"
+exec "$RUNTIME_DIR/lib/ld-musl-x86_64.so.1" --library-path "$RUNTIME_DIR/lib" "$BIN_DIR/fio.bin" "$@"
