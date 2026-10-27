@@ -119,10 +119,10 @@ func TestTransportFailureNeverSplitsIntoBadSectors(t *testing.T) {
 			if recover && calls == 2 {
 				return len(p), nil
 			}
-			return 0, &scanIOError{Evidence: ScanIOEvidence{Kind: "TIMEOUT"}}
+			return 0, &scanIOError{Evidence: ScanIOEvidence{Kind: "TRANSPORT_ERROR"}}
 		})
 		r, err := m.readRegion(h, scanBuffer(65536), 65536, 8192, job, 200, 512)
-		if calls != 2 || (err == nil) != recover || len(r.badRanges) != 1 || r.badRanges[0].Code != "TIMEOUT" || *r.badRanges[0].Recovered != recover || r.errorCount == 0 {
+		if calls != 2 || (err == nil) != recover || len(r.badRanges) != 1 || r.badRanges[0].Code != "TRANSPORT_ERROR" || *r.badRanges[0].Recovered != recover || r.errorCount == 0 {
 			t.Fatalf("calls=%d %+v %v", calls, r, err)
 		}
 	}
@@ -224,7 +224,7 @@ func TestStoppedFullScanPublishesFailingCommand(t *testing.T) {
 	calls := 0
 	h := &scanTestHandle{read: func(p []byte, off int64) (int, error) {
 		calls++
-		return 0, &scanIOError{Evidence: ScanIOEvidence{Kind: "TIMEOUT", HostStatus: 3}}
+		return 0, &scanIOError{Evidence: ScanIOEvidence{Kind: "TRANSPORT_ERROR", HostStatus: 7}}
 	}}
 	m := newTestManager(t, JobManagerOptions{ResolveDisk: func(string) (*Disk, error) { return disk, nil }, Open: func(string) (ReadHandle, error) { return h, nil }})
 	job := &Job{ID: "12345678-1234-4123-8123-123456789abc", Type: "scan", Status: "queued", Device: disk.Path,
@@ -233,11 +233,11 @@ func TestStoppedFullScanPublishesFailingCommand(t *testing.T) {
 	m.jobs[job.ID] = job
 	err := m.runScan(job, "full")
 	if err == nil {
-		t.Fatal("timeout scan completed")
+		t.Fatal("transport failure scan completed")
 	}
 	m.fail(job, err)
 	r := job.Result.(*ScanResult)
-	if calls != 2 || job.Status != "failed" || r.Map[0].Status != "error" || r.Map[1].Status != "pending" || r.Stats.ErrorCells != 1 || len(r.Stats.BadRanges) != 1 || r.Stats.BadRanges[0].Code != "TIMEOUT" {
+	if calls != 2 || job.Status != "failed" || r.Map[0].Status != "error" || r.Map[1].Status != "pending" || r.Stats.ErrorCells != 1 || len(r.Stats.BadRanges) != 1 || r.Stats.BadRanges[0].Code != "TRANSPORT_ERROR" {
 		t.Fatalf("calls=%d job=%s result=%+v", calls, job.Status, r)
 	}
 }

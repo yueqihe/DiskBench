@@ -39,7 +39,7 @@ func TestDeepLatencyUsesIndependentWriteAndReadBands(t *testing.T) {
 		want        string
 	}{
 		{60, 60, "slower"}, // Sum is 120, but neither read nor write is severe.
-		{172, 1, "severe"}, {1, 172, "slower"}, {1, 600, "severe"},
+		{172, 1, "slower"}, {1000, 1, "severe"}, {1, 172, "slower"}, {1, 600, "severe"},
 	} {
 		cell := &ScanCell{}
 		r := writeRegionResult{bytesWritten: 8 * 1024 * 1024, milliseconds: tc.read + tc.write,

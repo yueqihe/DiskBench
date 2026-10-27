@@ -44,7 +44,7 @@ func appendUnresolvedProbeRange(ranges *[]BadRange, offset, length int64, eviden
 func sumUnresolvedProbeBytes(ranges []BadRange) int64 {
 	var total int64
 	for _, r := range ranges {
-		if r.Code == "LOCALIZATION_LIMIT" && r.Outcome == "unresolved" {
+		if (r.Code == "LOCALIZATION_LIMIT" || r.Code == "SLOW_READ_LIMIT") && r.Outcome == "unresolved" {
 			total += r.UnresolvedBytes
 		}
 	}

@@ -68,6 +68,10 @@ func scanIssueRange(offset, length int64, err error, recovered *bool) BadRange {
 		if errors.Is(err, errScanWaitTimeout) && v.RequestOffset != nil && v.RequestBytes > 0 {
 			r.Offset, r.Length = *v.RequestOffset, v.RequestBytes
 		}
+	} else if errors.Is(err, syscall.ENODATA) {
+		// This is a block-layer error, not a captured SCSI/NVMe response.
+		// Keep the cause without inventing sense data or a device-reported LBA.
+		r.Code, r.Detail = "MEDIUM_ERROR", "Linux 块层报告介质读取错误（ENODATA）"
 	}
 	return r
 }

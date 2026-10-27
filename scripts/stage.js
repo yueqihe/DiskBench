@@ -39,7 +39,17 @@ if (dependencySource) {
   fs.cpSync(dependencySource, packServer, { recursive: true, force: true });
   console.log(`Staged bundled runtime dependencies from ${path.relative(root, dependencySource)}`);
 } else if (targetArch) {
-  console.warn(`No bundled runtime dependencies found for ${targetArch}; using fnOS system tools.`);
+  throw new Error(`No bundled runtime dependencies found for ${targetArch}`);
 }
+
+// Release notices live alongside the separately bundled tools and libraries.
+// Never copy development caches, reference documents or machine data.
+const licenseDir = path.join(runtimeDepsRoot, "licenses");
+if (!fs.existsSync(licenseDir) || !fs.existsSync(path.join(runtimeDepsRoot, "sources.json"))) {
+  throw new Error("Missing third-party license texts or source manifest");
+}
+fs.cpSync(licenseDir, path.join(packServer, "licenses"), { recursive: true });
+fs.copyFileSync(path.join(runtimeDepsRoot, "THIRD_PARTY.md"), path.join(packServer, "THIRD_PARTY_NOTICES.txt"));
+fs.copyFileSync(path.join(runtimeDepsRoot, "sources.json"), path.join(packServer, "third-party-sources.json"));
 
 console.log(`Staged FPK application files in ${packServer}`);

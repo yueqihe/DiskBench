@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -8,14 +9,22 @@ import (
 )
 
 // Host read requests, not pure firmware service time. Capping the request
-// avoids treating an entire 8 MiB transfer as one device stall. Native NVMe
-// may split further to respect MDTS; the measured unit stays <= 128 KiB.
+// avoids treating an entire 8 MiB transfer as one device stall. The kernel
+// may split further for device limits; the measured unit stays <= 128 KiB.
 const scanLatencyRequestBytes = 128 * 1024
+
+const scanLegacyTransferSevereMS = 1000.0
 
 type ScanReadLatency struct {
 	Ms     float64 `json:"ms"`
 	Bytes  int     `json:"bytes"`
 	Offset int64   `json:"offset"`
+}
+
+type scanReadFailure struct {
+	Offset int64
+	Bytes  int
+	Err    error
 }
 
 type scanRequestReader struct {
@@ -29,6 +38,17 @@ type scanRequestReader struct {
 	recheckAfterMs float64
 	suspectReads   []ScanReadLatency
 	ioBytes        int64
+	failure        *scanReadFailure
+}
+
+func (h *scanRequestReader) failureSnapshot() *scanReadFailure {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.failure == nil {
+		return nil
+	}
+	copy := *h.failure
+	return &copy
 }
 
 func (h *scanRequestReader) record(ms float64, size int, offset int64) {
@@ -101,6 +121,11 @@ func (h *scanRequestReader) ReadAt(p []byte, offset int64) (int, error) {
 		}
 		completed += n
 		if err != nil || n != size {
+			if err != nil && !errors.Is(err, errScanSlowBudget) && !errors.Is(err, errScanProbeBudget) {
+				h.mu.Lock()
+				h.failure = &scanReadFailure{Offset: offset + int64(completed-n), Bytes: size, Err: err}
+				h.mu.Unlock()
+			}
 			return completed, err
 		}
 	}
@@ -108,11 +133,15 @@ func (h *scanRequestReader) ReadAt(p []byte, offset int64) (int, error) {
 }
 
 // Project response-warning policy; slow responses alone do not establish bad sectors.
-func scanRequestStatus(ms float64, rotational bool) string {
-	slow, slower, severe := 20.0, 50.0, 100.0
+func scanReadThresholds(rotational bool) (slow, slower, severe float64) {
 	if rotational {
-		slow, slower, severe = 50, 150, 500
+		return 50, 200, 800
 	}
+	return 20, 50, 500
+}
+
+func scanRequestStatus(ms float64, rotational bool) string {
+	slow, slower, severe := scanReadThresholds(rotational)
 	switch {
 	case ms >= severe:
 		return "severe"
@@ -138,10 +167,24 @@ func applyScanReadLatency(cell *ScanCell, sample *ScanReadLatency, rotational bo
 		v := *sample
 		cell.MaxReadLatency = &v
 	}
-	if cell.ErrorCount > 0 || cell.MaxReadLatency == nil {
+	if cell.ErrorCount > 0 || cell.Repair != nil && cell.Repair.Failed > 0 {
+		cell.Status = "error"
 		return
 	}
-	status := scanRequestStatus(cell.MaxReadLatency.Ms, rotational)
+	if cell.Repair != nil && cell.Repair.Pending > 0 || scanPersistentSlowBlock(*cell, rotational) != nil {
+		cell.Status = "severe"
+		return
+	}
+	status := "normal"
+	if cell.MaxUnitMs != nil {
+		status = scanRequestStatus(*cell.MaxUnitMs, rotational)
+	}
+	if cell.MaxReadLatency != nil {
+		requestStatus := scanRequestStatus(cell.MaxReadLatency.Ms, rotational)
+		if scanStatusRank(requestStatus) > scanStatusRank(status) {
+			status = requestStatus
+		}
+	}
 	if scanStatusRank(status) > scanStatusRank(cell.Status) {
 		cell.Status = status
 	}
@@ -149,9 +192,9 @@ func applyScanReadLatency(cell *ScanCell, sample *ScanReadLatency, rotational bo
 
 func scanLatencyBasis(rotational bool) string {
 	if rotational {
-		return "hdd-dual-v2"
+		return "hdd-dual-v4"
 	}
-	return "solid-dual-v2"
+	return "solid-dual-v4"
 }
 
 // Writes have separate warning bands: device write-cache and flash-program
@@ -189,9 +232,9 @@ func applyScanWriteLatency(cell *ScanCell, sample *ScanReadLatency, rotational b
 
 func writeLatencyBasis(rotational bool) string {
 	if rotational {
-		return "hdd-write-dual-v2"
+		return "hdd-write-dual-v4"
 	}
-	return "solid-write-dual-v2"
+	return "solid-write-dual-v4"
 }
 
 func (m *JobManager) updateWriteCell(cell *ScanCell, read writeRegionResult, length int64, rotational bool) {

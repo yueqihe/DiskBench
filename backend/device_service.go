@@ -715,6 +715,29 @@ func getSystemPaths() map[string]bool {
 	return paths
 }
 
+// findmnt --raw uses \xHH, while mount-table output may use octal escapes.
+// Decode each input byte once so a literal escape-looking filename stays literal.
+func decodeMountField(value string) string {
+	var decoded strings.Builder
+	decoded.Grow(len(value))
+	for i := 0; i < len(value); {
+		if value[i] == '\\' && i+3 < len(value) {
+			base, start := 8, i+1
+			if value[i+1] == 'x' {
+				base, start = 16, i+2
+			}
+			if b, err := strconv.ParseUint(value[start:i+4], base, 8); err == nil {
+				decoded.WriteByte(byte(b))
+				i += 4
+				continue
+			}
+		}
+		decoded.WriteByte(value[i])
+		i++
+	}
+	return decoded.String()
+}
+
 func parseStorageMounts(output string) []storageMount {
 	var mounts []storageMount
 	scanner := bufio.NewScanner(strings.NewReader(output))
@@ -724,7 +747,7 @@ func parseStorageMounts(output string) []storageMount {
 			continue
 		}
 		for i := range fields {
-			fields[i] = strings.NewReplacer(`\040`, " ", `\011`, "\t", `\012`, "\n", `\134`, `\`).Replace(fields[i])
+			fields[i] = decodeMountField(fields[i])
 		}
 		if !safeStorageMountPath(fields[0]) {
 			continue

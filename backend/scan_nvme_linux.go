@@ -31,25 +31,15 @@ var _ [24 - unsafe.Offsetof(scanNVMeCommand{}.Addr)]byte
 var _ [unsafe.Offsetof(scanNVMeCommand{}.Addr) - 24]byte
 
 type nvmeScanHandle struct {
-	file          *os.File
+	*blockScanHandle
 	disk          Disk
 	once          sync.Once
 	mu            sync.Mutex
 	info          NVMeScanInfo
-	native        bool
+	adminReady    bool
 	note          string
 	initErr       error
-	closed        atomic.Bool
 	selfTestOwned atomic.Bool
-	closeOnce     sync.Once
-	closeDone     chan struct{}
-}
-
-func configureScanReader(handle ReadHandle, disk Disk, snapshot DiskSnapshot) ReadHandle {
-	if file, ok := handle.(*os.File); ok && isNativeNVMe(disk) {
-		return &nvmeScanHandle{file: file, disk: disk, closeDone: make(chan struct{})}
-	}
-	return configureHDDScan(handle, snapshot)
 }
 
 func (h *nvmeScanHandle) control(request uintptr, arg unsafe.Pointer) (uintptr, error) {
@@ -69,16 +59,14 @@ func (h *nvmeScanHandle) control(request uintptr, arg unsafe.Pointer) (uintptr, 
 	return ret, nil
 }
 
-func (h *nvmeScanHandle) command(admin bool, cmd *scanNVMeCommand, data []byte) error {
+// Protocol commands are limited to Identify, logs and optional self-test.
+// Scan data always uses blockScanHandle.ReadAt, never NVMe I/O passthrough.
+func (h *nvmeScanHandle) adminCommand(cmd *scanNVMeCommand, data []byte) error {
 	if len(data) > 0 {
 		cmd.Addr = unsafe.Pointer(&data[0])
 		cmd.DataLen = uint32(len(data))
 	}
-	request := uintptr(0xc0484e43) // NVME_IOCTL_IO_CMD
-	if admin {
-		request = 0xc0484e41
-	}
-	status, err := h.control(request, unsafe.Pointer(cmd))
+	status, err := h.control(0xc0484e41, unsafe.Pointer(cmd)) // NVME_IOCTL_ADMIN_CMD
 	runtime.KeepAlive(data)
 	runtime.KeepAlive(cmd)
 	if err != nil {
@@ -102,14 +90,14 @@ func (h *nvmeScanHandle) command(admin bool, cmd *scanNVMeCommand, data []byte) 
 
 func (h *nvmeScanHandle) prepare() error {
 	h.once.Do(func() {
+		if err := h.blockScanHandle.prepare(); err != nil {
+			h.initErr = err
+			return
+		}
 		h.mu.Lock()
 		defer h.mu.Unlock()
 		fallback := func(err error) {
-			if e := scanProtocolError(err); e != nil && e.Evidence.Kind != "ILLEGAL_REQUEST" {
-				h.initErr = err
-				return
-			}
-			h.note = fmt.Sprintf("NVMe 原生命令不可用，使用 O_DIRECT；无法细分原生状态：%v", err)
+			h.note = fmt.Sprintf("NVMe 识别或固件自检信息不可用，不影响块设备读取：%v", err)
 		}
 		nsid, err := h.control(0x4e40, nil) // NVME_IOCTL_ID, never derive from the path.
 		if err != nil || nsid == 0 || nsid >= 0xffffffff {
@@ -132,11 +120,11 @@ func (h *nvmeScanHandle) prepare() error {
 			return
 		}
 		ctrl, ns := make([]byte, 4096), make([]byte, 4096)
-		if err = h.command(true, &scanNVMeCommand{Opcode: 6, CDW10: 1, Timeout: 10000}, ctrl); err != nil {
+		if err = h.adminCommand(&scanNVMeCommand{Opcode: 6, CDW10: 1, Timeout: 10000}, ctrl); err != nil {
 			fallback(err)
 			return
 		}
-		if err = h.command(true, &scanNVMeCommand{Opcode: 6, NSID: uint32(nsid), CDW10: 0, Timeout: 10000}, ns); err != nil {
+		if err = h.adminCommand(&scanNVMeCommand{Opcode: 6, NSID: uint32(nsid), CDW10: 0, Timeout: 10000}, ns); err != nil {
 			fallback(err)
 			return
 		}
@@ -146,11 +134,11 @@ func (h *nvmeScanHandle) prepare() error {
 			return
 		}
 		if err != nil {
-			h.initErr = err
+			fallback(err)
 			return
 		}
-		h.info, h.native = info, true
-		h.note = fmt.Sprintf("NVMe 原生只读，NSID %d；逻辑地址由控制器映射，TRIM 后的可读区域不代表全部物理 NAND 已检测", nsid)
+		h.info, h.adminReady = info, true
+		h.note = fmt.Sprintf("NVMe NSID %d，已读取固件自检能力；数据扫描使用块 I/O，TRIM 后的可读区域不代表全部物理 NAND 已检测", nsid)
 	})
 	return h.initErr
 }
@@ -158,10 +146,7 @@ func (h *nvmeScanHandle) prepare() error {
 func (h *nvmeScanHandle) scanReadInfo() (string, string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.native {
-		return "nvme-read", h.note
-	}
-	return "direct", h.note
+	return scanReadMethod, scanDirectReadNote + "；" + h.note
 }
 
 func (h *nvmeScanHandle) nvmeInfo() NVMeScanInfo { h.mu.Lock(); defer h.mu.Unlock(); return h.info }
@@ -173,42 +158,13 @@ func (h *nvmeScanHandle) ReadAt(p []byte, offset int64) (int, error) {
 	if err := h.prepare(); err != nil {
 		return 0, err
 	}
-	if !h.native {
-		return h.file.ReadAt(p, offset)
-	}
-	completed := 0
-	for completed < len(p) {
-		if h.closed.Load() {
-			return completed, os.ErrClosed
-		}
-		length := min(h.info.MaxReadBytes, len(p)-completed)
-		lo, hi, count, err := nvmeReadWords(offset+int64(completed), length, h.disk.LogicalSectorSize)
-		if err != nil {
-			return completed, err
-		}
-		cmd := scanNVMeCommand{Opcode: 2, NSID: h.info.NSID, CDW10: lo, CDW11: hi, CDW12: count, Timeout: 60000}
-		if err = h.command(false, &cmd, p[completed:completed+length]); err != nil {
-			// Only an unavailable interface may fall back. Never hide a device
-			// completion status (including invalid-field/permission statuses).
-			if errors.Is(err, syscall.ENOTTY) || errors.Is(err, syscall.EOPNOTSUPP) || errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EACCES) {
-				h.mu.Lock()
-				h.native = false
-				h.note = "NVMe I/O 透传不可用，使用 O_DIRECT，错误原因无法细分"
-				h.mu.Unlock()
-				n, readErr := h.file.ReadAt(p[completed:], offset+int64(completed))
-				return completed + n, readErr
-			}
-			return completed, classifyScanSystemError(err)
-		}
-		completed += length
-	}
-	return completed, nil
+	return h.blockScanHandle.ReadAt(p, offset)
 }
 
 func (h *nvmeScanHandle) selfTestLog() ([]byte, error) {
 	data := make([]byte, 564)
 	// Controller-wide log; entries are filtered by valid namespace/LBA bits.
-	err := h.command(true, &scanNVMeCommand{Opcode: 2, NSID: 0xffffffff, CDW10: 6 | ((564/4 - 1) << 16), Timeout: 10000}, data)
+	err := h.adminCommand(&scanNVMeCommand{Opcode: 2, NSID: 0xffffffff, CDW10: 6 | ((564/4 - 1) << 16), Timeout: 10000}, data)
 	return data, err
 }
 
@@ -219,14 +175,14 @@ func (h *nvmeScanHandle) startSelfTest() error {
 	if err := h.prepare(); err != nil {
 		return err
 	}
-	if !h.native || !h.info.SelfTestSupported {
+	if !h.adminReady || !h.info.SelfTestSupported {
 		return errors.New("当前 NVMe 不支持或无法访问固件自检")
 	}
 	// Set ownership before submission so cancellation during the ioctl will
 	// wait for its completion, then abort only a test we successfully started.
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	err := h.command(true, &scanNVMeCommand{Opcode: 0x14, NSID: h.info.NSID, CDW10: 2, Timeout: 10000}, nil)
+	err := h.adminCommand(&scanNVMeCommand{Opcode: 0x14, NSID: h.info.NSID, CDW10: 2, Timeout: 10000}, nil)
 	if err == nil {
 		h.selfTestOwned.Store(true)
 	}
@@ -245,7 +201,7 @@ func (h *nvmeScanHandle) Close() error {
 			defer close(h.closeDone)
 			h.mu.Lock()
 			if h.selfTestOwned.Swap(false) {
-				_ = h.command(true, &scanNVMeCommand{Opcode: 0x14, NSID: h.info.NSID, CDW10: 0xf, Timeout: 10000}, nil)
+				_ = h.adminCommand(&scanNVMeCommand{Opcode: 0x14, NSID: h.info.NSID, CDW10: 0xf, Timeout: 10000}, nil)
 			}
 			h.mu.Unlock()
 			_ = h.file.Close()
@@ -266,7 +222,7 @@ func nativeNVMeNSID(disk Disk) uint32 {
 		return 0
 	}
 	defer f.Close()
-	h := nvmeScanHandle{file: f}
+	h := nvmeScanHandle{blockScanHandle: &blockScanHandle{file: f}}
 	nsid, err := h.control(0x4e40, nil)
 	if err != nil || nsid == 0 || nsid >= 0xffffffff {
 		return 0

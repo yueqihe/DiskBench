@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"os"
@@ -291,6 +292,12 @@ func validateCreateJobBody(body map[string]interface{}) error {
 			return newJobError("resumeFrom 必须是有效的扫描任务 ID", "INVALID_ARGUMENT", 400)
 		}
 	}
+	if raw, exists := body["scanRepairFrom"]; exists {
+		id, valid := raw.(string)
+		if !valid || typeName != "scan" || !jobIDPattern.MatchString(id) || body["scanRepair"] != true || body["resumeFrom"] != nil {
+			return newJobError("按记录修复需要有效扫描记录且不能同时续扫", "INVALID_ARGUMENT", 400)
+		}
+	}
 	device, _ := body["device"].(string)
 	device = strings.TrimSpace(device)
 	if device == "" || len(device) > 4096 || strings.ContainsRune(device, '\x00') {
@@ -548,7 +555,22 @@ func (a *apiServer) handleApi(w http.ResponseWriter, r *http.Request, pathname s
 			return
 		}
 		id := strings.TrimSuffix(strings.TrimPrefix(pathname, "/api/jobs/"), "/scan-issues")
-		page, err := store.scanIssues(id, offset, int(limit))
+		readPage := store.scanIssues
+		if views := searchParams["view"]; len(views) > 0 {
+			if len(views) != 1 || views[0] != "ranges" {
+				a.apiError(w, newJobError("异常明细视图无效", "INVALID_ARGUMENT", 400))
+				return
+			}
+			ranges, ok := a.jobs.(interface {
+				scanIssueRanges(string, int64, int) (*ScanIssuePage, error)
+			})
+			if !ok {
+				a.apiError(w, newJobError("异常明细暂不可用", "SCAN_ISSUES_UNAVAILABLE", 409))
+				return
+			}
+			readPage = ranges.scanIssueRanges
+		}
+		page, err := readPage(id, offset, int(limit))
 		if err != nil {
 			a.apiError(w, mapJobError(err))
 			return
@@ -556,34 +578,62 @@ func (a *apiServer) handleApi(w http.ResponseWriter, r *http.Request, pathname s
 		a.json(w, 200, map[string]interface{}{"issues": page})
 		return
 	case jobScanReportRe.MatchString(pathname):
-		store, ok := a.jobs.(interface {
-			prepareScanReport(string) (func(io.Writer) error, error)
-		})
-		if !ok {
-			a.apiError(w, newJobError("扫描报告暂不可用", "SCAN_ISSUES_UNAVAILABLE", 409))
-			return
-		}
 		id := strings.TrimSuffix(strings.TrimPrefix(pathname, "/api/jobs/"), "/scan-report")
-		stream, err := store.prepareScanReport(id)
+		format := "html"
+		if formats := searchParams["format"]; len(formats) > 0 {
+			if len(formats) != 1 || (formats[0] != "html" && formats[0] != "json") {
+				a.apiError(w, newJobError("报告格式必须为 html 或 json", "INVALID_ARGUMENT", 400))
+				return
+			}
+			format = formats[0]
+		}
+		var stream func(io.Writer) error
+		var err error
+		filename := "diskbench-scan-" + id + ".json"
+		contentType := "application/json; charset=utf-8"
+		if format == "json" {
+			store, ok := a.jobs.(interface {
+				prepareScanReport(string) (func(io.Writer) error, error)
+			})
+			if !ok {
+				a.apiError(w, newJobError("扫描报告暂不可用", "SCAN_ISSUES_UNAVAILABLE", 409))
+				return
+			}
+			stream, err = store.prepareScanReport(id)
+		} else {
+			store, ok := a.jobs.(interface {
+				prepareScanHTMLReport(string) (func(io.Writer) error, string, error)
+			})
+			if !ok {
+				a.apiError(w, newJobError("扫描报告暂不可用", "SCAN_ISSUES_UNAVAILABLE", 409))
+				return
+			}
+			stream, filename, err = store.prepareScanHTMLReport(id)
+			contentType = "text/html; charset=utf-8"
+		}
 		if err != nil {
 			a.apiError(w, mapJobError(err))
 			return
 		}
 		a.applyHeaders(w)
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.Header().Set("Content-Disposition", `attachment; filename="diskbench-scan-`+id+`.json"`)
+		w.Header().Set("Content-Type", contentType)
+		w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": filename}))
+		if format == "html" {
+			w.Header().Set("Content-Security-Policy", scanReportCSP())
+		}
 		if err := stream(w); err != nil {
 			a.logger.Errorf("[diskbench] 导出扫描报告失败 (%v)", err)
 		}
 		return
 	case pathname == "/api/health":
 		capabilities := map[string]interface{}{
-			"scan":   a.mockDev || a.findExecutableFn("lsblk") != "",
-			"dd":     true,
-			"fio":    a.mockDev || a.findExecutableFn("fio") != "",
-			"fstrim": a.mockDev || a.findExecutableFn("fstrim") != "",
-			"smart":  a.mockDev || a.findExecutableFn("smartctl") != "",
-			"mock":   a.mockDev,
+			"scan":           a.mockDev || a.findExecutableFn("lsblk") != "",
+			"dd":             true,
+			"fio":            a.mockDev || a.findExecutableFn("fio") != "",
+			"fstrim":         a.mockDev || a.findExecutableFn("fstrim") != "",
+			"smart":          a.mockDev || a.findExecutableFn("smartctl") != "",
+			"mock":           a.mockDev,
+			"recordedRepair": true,
 		}
 		username := r.Header.Get("X-Trim-Username")
 		if a.localDev {
@@ -808,7 +858,7 @@ func (a *apiServer) serveStatic(w http.ResponseWriter, r *http.Request, pathname
 		contentType = "application/octet-stream"
 	}
 	a.applyHeaders(w)
-	if extension != ".html" {
+	if extension != ".html" && strings.HasPrefix(requested, "assets/") {
 		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 	}
 	w.Header().Set("Content-Type", contentType)

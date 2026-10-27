@@ -67,6 +67,38 @@ func TestParseStorageMountsKeepsFnOSAndExternalDiskMounts(t *testing.T) {
 	}
 }
 
+func TestParseStorageMountsDecodesFindmntPaths(t *testing.T) {
+	for _, tc := range []struct {
+		name, encoded, path string
+	}{
+		{"fnos external disk", `/vol00/HGST\x20HSH721414ALE6M4`, "/vol00/HGST HSH721414ALE6M4"},
+		{"utf8", `/media/\xe5\xa4\x87\xe4\xbb\xbd\x20SSD`, "/media/备份 SSD"},
+		{"hex backslash", `/media/Backup\x5cDisk`, `/media/Backup\Disk`},
+		{"literal hex escape", `/media/Backup\x5cx20Disk`, `/media/Backup\x20Disk`},
+		{"literal octal escape", `/media/Backup\134040Disk`, `/media/Backup\040Disk`},
+		{"legacy octal", `/media/Backup\040Disk`, "/media/Backup Disk"},
+		{"incomplete escape", `/media/Backup\x2`, `/media/Backup\x2`},
+		{"unknown escape", `/media/Backup\xyz`, `/media/Backup\xyz`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mounts := parseStorageMounts(tc.encoded + " /dev/sdd f2fs 14000251207680 13796031946752 rw,relatime\n")
+			disks := []Disk{{Path: "/dev/sdd", Mountpoints: []string{tc.path}}}
+			spaces := deriveStorageSpaces(disks, mounts)
+			if len(spaces) != 1 || spaces[0].Path != tc.path || len(spaces[0].Members) != 1 || spaces[0].Members[0] != "/dev/sdd" {
+				t.Fatalf("decoded volume must match the real disk mountpoint: %+v", spaces)
+			}
+		})
+	}
+}
+
+func TestParseStorageMountsValidatesDecodedPath(t *testing.T) {
+	for _, encoded := range []string{`\x2f`, `/\x64ev/sdd`, `/media/\x2e\x2e/etc`, `/media/Disk\x00`, `/media/Disk\x0aOther`, `/media/Disk\012Other`} {
+		if mounts := parseStorageMounts(encoded + " /dev/sdd f2fs 1000 500 rw\n"); len(mounts) != 0 {
+			t.Errorf("unsafe decoded path %q accepted: %+v", encoded, mounts)
+		}
+	}
+}
+
 func TestSafeStorageMountPathRejectsRootAndTraversal(t *testing.T) {
 	for value, want := range map[string]bool{
 		"/vol1": true, "/media/USB Disk": true, "/": false, "relative": false,
@@ -291,7 +323,9 @@ func TestClassifyLatencyBuckets(t *testing.T) {
 		{49.9, 0, "normal"},
 		{50, 0, "slow"},
 		{499.9, 0, "slow"},
-		{500, 0, "severe"},
+		{500, 0, "slow"},
+		{999.99, 0, "slow"},
+		{1000, 0, "severe"},
 		{1, 1, "error"},
 	}
 	for _, c := range cases {

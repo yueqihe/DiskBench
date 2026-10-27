@@ -31,15 +31,91 @@ const SLOW_SCAN_STATUSES = new Set(["slow", "slower", "severe", "under150", "und
 
 // Split normalized timing bands, preserving explicit response-warning verdicts.
 // Legacy history retains its original timing bands.
-export function scanStatusGroup(status, maxUnitMs) {
+export function scanStatusGroup(status, maxUnitMs, latencyBasis = "") {
   if (status === "normal" && Number.isFinite(maxUnitMs) && maxUnitMs >= 0) {
     return maxUnitMs < 5 ? "fast" : maxUnitMs < 20 ? "good" : "normal";
   }
   if (status === "slow") {
-    return Number.isFinite(maxUnitMs) && maxUnitMs >= 0 && maxUnitMs < 150 ? "slow" : "slower";
+    const poorAfterMs = /-dual-v4$/.test(latencyBasis) ? latencyBasis.startsWith("hdd-") ? 200 : 50 : 150;
+    return Number.isFinite(maxUnitMs) && maxUnitMs >= 0 && maxUnitMs < poorAfterMs ? "slow" : "slower";
   }
   return ({ under5: "fast", under20: "good", under50: "normal",
     under150: "slow", under500: "slower", over500: "severe" })[status] || status;
+}
+
+function severeScanStatus(status) {
+  return status === "severe" || status === "over500";
+}
+
+export function scanAbnormalCellCount(map) {
+  return Array.isArray(map) ? map.filter((cell) => cell?.status === "error" || severeScanStatus(cell?.status)).length : 0;
+}
+
+export function scanSlowBadBlock(cell, rotational = false) {
+  const proof = cell?.slowBadBlock;
+  const threshold = rotational ? 800 : 500;
+  return proof && Number.isSafeInteger(proof.offset) && Number.isSafeInteger(proof.bytes) && proof.bytes > 0 && proof.bytes <= 128*1024
+    && proof.offset >= cell.start && proof.offset + proof.bytes <= cell.end
+    && Number.isFinite(proof.firstMs) && proof.firstMs >= threshold && Number.isFinite(proof.repeatMs) && proof.repeatMs >= threshold
+    && proof.load?.backgroundActivity === false ? proof : null;
+}
+
+export function scanBadBlockKind(cell, rotational = false) {
+  if (cell?.unreadableBytes > 0 || cell?.readOutcome === "unreadable") return "unreadable";
+  return scanSlowBadBlock(cell,rotational) ? "slow" : "";
+}
+
+export function scanBadBlockSummary(map, rotational = false) {
+  const summary = { total:0, slow:0, unreadable:0 };
+  for (const cell of Array.isArray(map) ? map : []) {
+    const kind = scanBadBlockKind(cell,rotational);
+    if (kind) { summary[kind]++; summary.total++; }
+  }
+  return summary;
+}
+
+export function scanRepairOutcomeLabel(repair) {
+  if (repair?.outcome === "verified" && repair.speedOutcome === "improved") return "慢速改善 · 写回校验通过";
+  return ({ pending:"已备份，准备写回", uncertain:"写回中断，结果未确定", verified:"写回校验通过", still_slow:"修复后仍慢", skipped:"已跳过写回", failed:"写回或校验失败" })[repair?.outcome] || "写回状态未知";
+}
+
+export function scanRepairSpeedNote(repair, threshold) {
+  if (repair?.speedOutcome === "improved") return "慢速改善";
+  if (repair?.speedOutcome === "still_slow") return "复测仍慢，建议更换硬盘";
+  const checks = repair?.speedChecks || [];
+  if (!checks.length) return "复测未记录";
+  if (checks.length !== 2) return "复测未完成";
+  if (!repair.speedLoad) return "复测负载未知";
+  if (repair.speedLoad.backgroundActivity) return "复测有其他磁盘活动";
+  if (!(threshold > 0)) return "改善未确认";
+  const firstFast = checks[0] < threshold, repeatFast = checks[1] < threshold;
+  if (firstFast !== repeatFast) return "复测波动";
+  if (firstFast && repeatFast) {
+    if ((Number.isFinite(repair.currentBeforeMs) && repair.currentBeforeMs < threshold)
+      || (Number.isFinite(repair.beforeRepeatMs) && repair.beforeRepeatMs < threshold)) return "修复前已恢复";
+    if (!repair.beforeLoad) return "修复前负载未知";
+    if (repair.beforeLoad.backgroundActivity) return "修复前有其他磁盘活动";
+  }
+  return "改善未确认";
+}
+
+export function scanRepairStages(repair) {
+  const write = ({ pending:"待处理", uncertain:"未确认", verified:"已校验", still_slow:"已校验", skipped:"已跳过", failed:"未通过" })[repair?.outcome] || "未知";
+  const stages = [{ label:"首次", ms:repair?.beforeMs }];
+  if (Number.isFinite(repair?.beforeRepeatMs)) stages.push({ label:"修复前", ms:repair.beforeRepeatMs });
+  stages.push({ label:"写回", text:write });
+  const checks = repair?.speedChecks || [];
+  if (["verified", "still_slow"].includes(repair?.outcome) && checks.length === 2) {
+    stages.push({ label:"复测", values:checks });
+  } else {
+    // A legacy afterMs is a read-back timing, not a pair of speed retests.
+    if (!checks.length && Number.isFinite(repair?.afterMs)) stages.push({ label:"校验", ms:repair.afterMs });
+    const state = repair?.outcome === "skipped" ? "未执行"
+      : ["pending", "uncertain"].includes(repair?.outcome) || checks.length === 1 ? "未完成"
+      : repair?.outcome === "failed" ? (checks.length ? "未通过" : "未执行") : "未记录";
+    stages.push({ label:"复测", text:state });
+  }
+  return stages;
 }
 const SPEED_LABELS = new Set(["头部", "中部", "尾部", "随机"]);
 const SPEED_POSITION_LABELS = {
@@ -101,6 +177,8 @@ function scanCellIsValid(cell, index, previousEnd) {
     || !optionalSafeNonNegativeInteger(cell.coveredBytes)
     || !optionalSafeNonNegativeInteger(cell.unreadableBytes)
     || !optionalSafeNonNegativeInteger(cell.unresolvedBytes)
+    || !optionalSafeNonNegativeInteger(cell.skippedBytes)
+    || (cell.skippedBytes ?? 0) > (cell.unresolvedBytes ?? 0)
     || (cell.coveredBytes ?? 0) + (cell.unresolvedBytes ?? 0) > cell.end - cell.start
     || !optionalSafeNonNegativeInteger(cell.recoveredRanges)
     || !optionalSafeNonNegativeInteger(cell.deviceErrorRanges)
@@ -164,9 +242,12 @@ function validBadRanges(value, diskSize) {
       || !safeNonNegativeInteger(range.offset)
       || !Number.isSafeInteger(range.length)
       || range.length <= 0
+      || !optionalSafeNonNegativeInteger(range.probeBytes)
       || !optionalSafeNonNegativeInteger(range.unresolvedBytes)
       || (range.unresolvedBytes ?? 0) > range.length
-      || ((range.unresolvedBytes ?? 0) > 0 && (range.code !== "LOCALIZATION_LIMIT" || range.outcome !== "unresolved"))) {
+      || ((range.unresolvedBytes ?? 0) > 0 && (!["LOCALIZATION_LIMIT", "SLOW_READ_LIMIT"].includes(range.code) || range.outcome !== "unresolved"))
+      || (range.code === "SLOW_READ_LIMIT" && (range.outcome !== "unresolved" || range.unresolvedBytes !== range.length || !text(range.detail)))
+      || (range.skippedRange != null && !validTimeoutSkippedRange(range))) {
       return false;
     }
     const end = range.offset + range.length;
@@ -174,15 +255,57 @@ function validBadRanges(value, diskSize) {
   });
 }
 
+function validTimeoutSkippedRange(range) {
+  const skipped = range.skippedRange;
+  return range.code === "TIMEOUT" && range.outcome === "device_error" && range.recovered !== true
+    && record(skipped) && safeNonNegativeInteger(skipped.offset)
+    && Number.isSafeInteger(skipped.length) && skipped.length > 0
+    && skipped.offset >= range.offset && Number.isSafeInteger(skipped.offset + skipped.length)
+    && skipped.offset + skipped.length === range.offset + range.length;
+}
+
+export function mergeTimeoutSkipRanges(ranges) {
+  const rows = [];
+  for (const range of Array.isArray(ranges) ? ranges : []) {
+    const previous = rows.at(-1);
+    if (previous && !previous.skippedRange && range.code === "SLOW_READ_LIMIT" && range.outcome === "unresolved"
+      && range.unresolvedBytes === range.length) {
+      const merged = {...previous, skippedRange:{offset:range.offset,length:range.length}};
+      if (validTimeoutSkippedRange(merged)) {
+        rows[rows.length-1] = merged;
+        continue;
+      }
+    }
+    rows.push(range);
+  }
+  return rows;
+}
+
 export function scanOutcomeSummary(job) {
   if (job?.type !== "scan" || job.result?.version !== 2 || !record(job.result.stats)) return null;
   const stats = job.result.stats;
-  const keys = ["coveredBytes", "issueCount", "savedIssueCount", "unreadableRanges", "unreadableBytes", "recoveredRanges", "deviceErrorRanges", "unresolvedRanges", "unresolvedBytes"];
+  const keys = ["coveredBytes", "issueCount", "savedIssueCount", "unreadableRanges", "unreadableBytes", "recoveredRanges", "deviceErrorRanges", "unresolvedRanges", "unresolvedBytes", "skippedBytes", "timeoutSkipPairs"];
   if (keys.some((key) => !optionalSafeNonNegativeInteger(stats[key]))) return null;
   if ((stats.coveredBytes ?? 0) > job.disk?.size
+    || (stats.skippedBytes ?? 0) > (stats.unresolvedBytes ?? 0)
     || (stats.savedIssueCount ?? 0) > (stats.issueCount ?? 0)
+    || (stats.timeoutSkipPairs ?? 0) > Math.min(stats.deviceErrorRanges ?? 0, stats.unresolvedRanges ?? 0)
     || (stats.issuesComplete === true && (stats.savedIssueCount ?? 0) !== (stats.issueCount ?? 0))) return null;
   return Object.fromEntries(keys.map((key) => [key, stats[key] ?? 0]));
+}
+
+export function scanIssueDisplayCount(job) {
+  const summary = scanOutcomeSummary(job);
+  const rawCount = summary?.issueCount ?? job?.result?.stats?.badRanges?.length ?? 0;
+  const candidates = job?.result?.stats?.repair?.candidates;
+  const severe = job?.type === "scan" && Array.isArray(job.result?.map)
+    ? job.result.map.filter((cell) => scanSlowBadBlock(cell,Boolean(job.disk?.rotational)) || (severeScanStatus(cell?.status) && !(cell.skippedBytes > 0))).length : 0;
+  const pairs = summary?.timeoutSkipPairs ?? 0;
+  if (!summary || !safeNonNegativeInteger(candidates)) return rawCount - pairs + severe;
+  // A repair candidate has one row even when it has both intent and result events.
+  const count = summary.unreadableRanges + summary.recoveredRanges
+    + summary.deviceErrorRanges + summary.unresolvedRanges + candidates;
+  return (count > 0 && count <= rawCount ? count : rawCount) - pairs + severe;
 }
 
 export function validScanIssuePage(page, diskSize, offset) {
@@ -193,17 +316,61 @@ export function validScanIssuePage(page, diskSize, offset) {
     && Array.isArray(page.records) && page.records.length <= 200
     && page.next - offset === page.records.length && validBadRanges(page.records, diskSize)
     && page.records.every((range) => typeof range.code === "string"
-      && (range.outcome === undefined || ["recovered", "unreadable", "device_error", "unresolved", "rewrite"].includes(range.outcome))
+      && (range.outcome === undefined || ["recovered", "unreadable", "device_error", "unresolved", "rewrite", "severe"].includes(range.outcome))
+      && (range.outcome !== "severe" || (["SEVERE_SLOW_READ","PERSISTENT_SLOW_READ"].includes(range.code) && Boolean(text(range.detail))))
       && validScanRepairRecord(range));
 }
 
 export function scanRangeOutcomeLabel(range) {
-	if (range?.outcome === "rewrite") return ({ pending: "已备份，准备写回", uncertain: "写回中断，结果未确定", verified: "写回校验通过", still_slow: "写回后仍慢", skipped: "已跳过写回", failed: "写回或校验失败" })[range.repair?.outcome] || "写回状态未知";
-  if (range?.outcome === "unreadable") return "持续不可读";
+	if (range?.skippedRange) return "读取超时，已跳过";
+	if (range?.code === "SLOW_READ_LIMIT") return "严重卡读，已跳过";
+	if (range?.outcome === "severe") return range.code === "PERSISTENT_SLOW_READ" ? "坏块（慢速）" : "严重慢读（待确认）";
+	if (range?.outcome === "rewrite") return scanRepairOutcomeLabel(range.repair);
+  if (range?.outcome === "unreadable") return "坏块（不可读）";
   if (range?.outcome === "recovered") return range.code === "RECOVERED_ERROR" ? "固件已纠正" : "复读已恢复";
   if (range?.outcome === "device_error") return range.recovered === true ? "设备异常已恢复" : "设备异常";
   if (range?.outcome === "unresolved") return range.code === "LOCALIZATION_LIMIT" ? "定位达到限额，待细查" : "范围未确定";
   return "历史异常";
+}
+
+export function scanRangeLocation(range, logicalSectorSize) {
+  const sector = Number.isSafeInteger(logicalSectorSize) && logicalSectorSize > 0 ? logicalSectorSize : null;
+  const validRange = record(range) && safeNonNegativeInteger(range.offset)
+    && Number.isSafeInteger(range.length) && range.length > 0
+    && Number.isSafeInteger(range.offset + range.length);
+  let precision = "unknown";
+  if (range?.outcome === "unresolved" || ["LOCALIZATION_LIMIT", "SLOW_READ_LIMIT"].includes(range?.code)) {
+    precision = "unresolved";
+  } else if (range?.outcome && range.outcome !== "unreadable") {
+    precision = "request";
+  } else if (validRange && range.outcome === "unreadable" && sector
+    && range.offset % sector === 0 && range.length % sector === 0
+    && Number.isSafeInteger(range.probeBytes) && range.probeBytes >= range.length && range.probeBytes % sector === 0
+    && range.recovered === false && ["EIO", "EREMOTEIO", "SHORT_READ", "READ_RETRY", "MEDIUM_ERROR", "DATA_INTEGRITY_ERROR", "RECOVERED_ERROR"].includes(range.code)) {
+    precision = range.probeBytes === sector && range.length === sector ? "sector" : "range";
+  }
+  return {
+    sectorBytes: sector,
+    startLba: validRange && sector ? Math.floor(range.offset / sector) : null,
+    endLba: validRange && sector ? Math.floor((range.offset + range.length - 1) / sector) : null,
+    precision,
+    label: range?.skippedRange ? "请求范围 · 跳过部分待定位" : { sector: "逐扇区确认", range: "范围确认（未逐扇区）", unresolved: "待定位（未确认坏扇区）", unknown: "定位精度未记录", request: "请求范围" }[precision]
+  };
+}
+
+export function scanCellLocationSummary(cell, ranges, logicalSectorSize) {
+  const locations = (Array.isArray(ranges) ? ranges : []).map((range) => scanRangeLocation(range, logicalSectorSize));
+  const exact = locations.some((value) => value.precision === "sector");
+  const coarse = locations.some((value) => value.precision === "range");
+  const incomplete = cell?.unresolvedBytes > 0 || locations.some((value) => value.precision === "unresolved");
+  if (exact) return `已定位到坏扇区${incomplete ? " · 其余待定位" : coarse ? " · 另有未细分范围" : ""}`;
+  if (coarse) return `已确认不可读范围 · 未细分到扇区${incomplete ? " · 其余待定位" : ""}`;
+  if (cell?.skippedBytes > 0) return "未完成 · 卡读跳过";
+  if (incomplete) return locations.some((value, index) => value.precision === "unresolved" && ranges[index].code === "LOCALIZATION_LIMIT")
+    ? "未完成 · 定位限额已到" : "定位未完成";
+  if (cell?.unreadableBytes > 0) return "旧记录未保存定位精度";
+  if (cell?.errorCount > 0) return "未确认坏扇区 · 查看读取异常";
+  return !cell || ["pending", "reading"].includes(cell.status) ? "尚未完成检测" : "本次已读范围未发现不可读扇区";
 }
 
 export function jobBelongsToDisk(job, disk) {
@@ -228,6 +395,13 @@ export function jobBelongsToDisk(job, disk) {
 
 export function findCurrentDiskForJob(disks, job) {
   return Array.isArray(disks) ? disks.find((disk) => jobBelongsToDisk(job, disk)) || null : null;
+}
+
+export function findLatestScanJob(jobs, disks) {
+  if (!Array.isArray(jobs) || jobs.some((job) => ACTIVE_JOB_STATUSES.has(job?.status))) return null;
+  const order = (job) => Number.isSafeInteger(job.historyOrder) ? job.historyOrder : 0;
+  return jobs.filter((job) => ["scan", "write"].includes(job?.type) && findCurrentDiskForJob(disks, job))
+    .sort((a, b) => order(b) - order(a) || (Date.parse(b.createdAt) || 0) - (Date.parse(a.createdAt) || 0))[0] || null;
 }
 
 export function findResumableScan(jobs, disk) {
@@ -295,11 +469,55 @@ export function scanRepairDiskBlockedReason(disk) {
   if (disk.readOnly === true) return "只读磁盘禁止慢扇区修复";
   if (Array.isArray(disk.mountpoints) && disk.mountpoints.some((value) => text(value))) return "请先卸载磁盘及其分区";
   if (![512,4096].includes(disk.logicalSectorSize)) return "需要明确的 512 B 或 4 KiB 逻辑扇区信息";
+  // A residual ZFS label is not proof of current use. The backend must obtain
+  // an exclusive device handle before starting a repair scan.
   const blockedFileSystems = Array.isArray(disk.fileSystems)
-    ? disk.fileSystems.map(text).filter((value) => /raid|zfs|bcache|lvm|luks|^swap$/i.test(value))
+    ? disk.fileSystems.map(text).filter((value) => /raid|bcache|lvm|luks|^swap$/i.test(value))
     : [];
   if (blockedFileSystems.length > 0) return `检测到 ${blockedFileSystems.join("、")} 标记，不能直接执行慢扇区修复`;
   return "";
+}
+
+export function recordedRepairCandidates(job, threshold = 1) {
+  if (job?.type !== "scan" || job.status !== "completed" || job.options?.scanRepairFrom || job.result?.version !== 2
+    || !["full", "sampled"].includes(job.result?.coverage) || !Number.isFinite(threshold) || threshold < 1) return [];
+  const map = safeScanMap(job.result.map);
+  const sector = job.disk?.logicalSectorSize;
+  if (![512, 4096].includes(sector) || ![2048, 4096].includes(map.length) || map.at(-1)?.end !== job.disk?.size) return [];
+  return map.filter((cell) => {
+    const read = cell.maxReadLatency;
+    if (!read || read.ms < threshold || cell.errorCount || cell.skippedBytes || !["readable", "recovered"].includes(cell.readOutcome)
+      || read.offset % sector !== 0 || read.bytes % sector !== 0) return false;
+    if (job.result.coverage !== "sampled") return true;
+    const ranges = cell.sampleRanges?.length ? cell.sampleRanges : [{ start: cell.sampleStart, end: cell.sampleEnd }];
+    return ranges.some((span) => Number.isSafeInteger(span.start) && Number.isSafeInteger(span.end)
+      && span.start >= cell.start && span.end <= cell.end && read.offset >= span.start && read.offset + read.bytes <= span.end);
+  });
+}
+
+export function isCompleteRecordedRepairResult(job) {
+  const result = job?.result;
+  const targets = result?.repairTargets;
+  const map = result?.map;
+  const repair = result?.stats?.repair;
+  if (!job?.options?.scanRepairFrom || job.status !== "completed" || result?.coverage !== "targeted"
+    || !Array.isArray(targets) || !targets.length || !Array.isArray(map) || map.length !== targets.length
+    || !repair || !["candidates", "pending", "verified", "stillSlow", "skipped", "failed", "writtenBytes"].every((key) => safeNonNegativeInteger(repair[key]))
+    || repair.pending !== 0 || repair.candidates !== targets.length
+    || !optionalSafeNonNegativeInteger(repair.improved) || (repair.improved || 0) > repair.verified
+    || repair.verified + repair.stillSlow + repair.skipped + repair.failed !== targets.length
+    || result.stats.testedCells !== targets.length || result.stats.issuesComplete !== true) return false;
+  return targets.every((target, index) => {
+    const cell = map[index];
+    const read = target?.read;
+    return Number.isSafeInteger(target?.cellIndex) && target.cellIndex >= 0 && target.cellIndex < 4096
+      && finiteNonNegative(read?.ms) && Number.isSafeInteger(read?.offset) && read.offset >= 0
+      && Number.isSafeInteger(read?.bytes) && read.bytes > 0 && read.bytes <= 128 * 1024
+      && read.offset + read.bytes <= job.disk?.size
+      && read.offset % job.disk.logicalSectorSize === 0 && read.bytes % job.disk.logicalSectorSize === 0
+      && cell?.index === index && cell.start === read.offset && cell.end === read.offset + read.bytes
+      && TERMINAL_SCAN_STATUSES.has(cell.status);
+  });
 }
 
 export function validScanRepairRecord(range) {
@@ -307,7 +525,12 @@ export function validScanRepairRecord(range) {
   const repair = range.repair;
   return record(repair) && ["pending", "uncertain", "verified", "still_slow", "skipped", "failed"].includes(repair.outcome)
     && finiteNonNegative(repair.beforeMs) && optionalFiniteNonNegative(repair.afterMs)
-    && safeNonNegativeInteger(repair.writtenBytes) && repair.writtenBytes <= range.length;
+    && safeNonNegativeInteger(repair.writtenBytes) && repair.writtenBytes <= range.length
+    && optionalFiniteNonNegative(repair.currentBeforeMs) && optionalFiniteNonNegative(repair.beforeRepeatMs)
+    && (repair.speedChecks == null || (Array.isArray(repair.speedChecks) && repair.speedChecks.length <= 2 && repair.speedChecks.every(finiteNonNegative)))
+    && (repair.speedOutcome == null || ["improved","still_slow","unconfirmed"].includes(repair.speedOutcome))
+    && (repair.speedOutcome !== "improved" || (repair.outcome === "verified" && repair.speedChecks?.length === 2 && repair.speedLoad?.backgroundActivity === false && repair.beforeLoad?.backgroundActivity === false))
+    && (repair.speedOutcome !== "still_slow" || (repair.outcome === "still_slow" && repair.speedChecks?.length === 2 && repair.speedLoad?.backgroundActivity === false));
 }
 
 export function buildSpeedTargets(disks, storageSpaces) {
@@ -646,6 +869,7 @@ export function isCompleteScanResult(job) {
     if (!scanOutcomeSummary(job) || stats.issuesComplete !== true) return false;
     const expectedCoverage = map.reduce((sum, cell) => sum + (coverage === "sampled" ? sampledCellBytes(cell) : cell.end - cell.start), 0);
     if ((stats.coveredBytes ?? 0) + (stats.unresolvedBytes ?? 0) !== expectedCoverage
+      || (stats.skippedBytes ?? 0) !== map.reduce((sum, cell) => sum + (cell.skippedBytes ?? 0), 0)
       || (stats.unresolvedBytes ?? 0) !== map.reduce((sum, cell) => sum + (cell.unresolvedBytes ?? 0), 0)
       || map.some((cell) => cell.coveredBytes + (cell.unresolvedBytes ?? 0) !== (coverage === "sampled" ? sampledCellBytes(cell) : cell.end - cell.start))) return false;
   }
@@ -653,7 +877,7 @@ export function isCompleteScanResult(job) {
   if (coverage === "full") {
     if (job.result.sampleBytes != null
       || expectedBytes > job.disk.size
-      || (expectedErrors === 0 && expectedBytes !== job.disk.size)) {
+      || (expectedErrors === 0 && expectedBytes + (job.type === "scan" && job.result.version === 2 ? stats.skippedBytes ?? 0 : 0) !== job.disk.size)) {
       return false;
     }
   } else {
@@ -664,6 +888,42 @@ export function isCompleteScanResult(job) {
     }
   }
   return true;
+}
+
+export function speedBenchmarkCells(job, rows) {
+  const options = job.options || {};
+  const cells = rows.flatMap((row) => ["read", "write", "mixed"].map((operation) => ({
+    row, operation, benchmark: null, active: false,
+    skipped: (Boolean(options.speedPattern) && options.speedPattern !== row.pattern)
+      || (["read", "write", "mixed"].includes(options.speedOperation) && options.speedOperation !== operation)
+      || (Boolean(options.speedProfileRow) && options.speedProfileRow !== row.profileRow)
+      || (options.speedProfile !== true && [
+        [options.speedBlockSize, row.blockSize], [options.speedQueueDepth, row.queueDepth], [options.speedThreads, row.threads]
+      ].some(([filter, value]) => filter > 0 && filter !== value))
+  })));
+  // Results arrive in execution order. Consume each once: Q1T1 profile rows
+  // can share every I/O parameter but must retain separate results and states.
+  for (const benchmark of Array.isArray(job.result?.benchmarks) ? job.result.benchmarks : []) {
+    if (!record(benchmark) || !Number.isFinite(benchmark.averageMBps)) continue;
+    const cell = cells.find(({ row, operation, skipped, benchmark: assigned }) => !skipped && !assigned
+      && benchmark.operation === operation && benchmark.pattern === row.pattern
+      && benchmark.blockSize === row.blockSize
+      && (benchmark.queueDepth ?? 1) === row.queueDepth
+      && (benchmark.threads ?? 1) === row.threads);
+    if (cell) cell.benchmark = benchmark;
+  }
+  const next = cells.find((cell) => !cell.skipped && !cell.benchmark);
+  const phase = text(job.phase);
+  const stage = /^(随机|(?:头部|中部|尾部)位置顺序)(混合读写|读取|写入)/.exec(phase);
+  const parameters = /Q(\d+)T(\d+)/.exec(phase);
+  // Preparation/TRIM are not a matrix test. Require both the next unfinished
+  // item and the actual I/O phase to agree, including during multi-run tests.
+  if (job.type === "speed" && job.status === "running" && next && stage && parameters) {
+    next.active = next.row.pattern === (stage[1] === "随机" ? "random" : "sequential")
+      && next.operation === ({ 读取: "read", 写入: "write", 混合读写: "mixed" })[stage[2]]
+      && next.row.queueDepth === Number(parameters[1]) && next.row.threads === Number(parameters[2]);
+  }
+  return cells;
 }
 
 export function isCompleteSpeedResult(job) {

@@ -37,6 +37,35 @@ func TestScanRealErrnoAndAlignedBuffer(t *testing.T) {
 	}
 }
 
+func TestScanBlockIOErrorLocatesLargeDiskAnd4KnAddresses(t *testing.T) {
+	for _, sector := range []int64{512, 4096} {
+		m := newTestManager(t, JobManagerOptions{})
+		job := &Job{ID: "block-io-location", Status: "running"}
+		const start = int64(3 * 1024 * 1024 * 1024 * 1024)
+		bad := start + 32768
+		h := scanReaderFunc(func(p []byte, offset int64) (int, error) {
+			if offset%sector != 0 || int64(len(p))%sector != 0 {
+				t.Fatalf("unaligned probe: offset=%d bytes=%d sector=%d", offset, len(p), sector)
+			}
+			if offset <= bad && offset+int64(len(p)) > bad {
+				return 0, &os.PathError{Op: "read", Path: "/dev/test", Err: syscall.EIO}
+			}
+			return len(p), nil
+		})
+		ranges, read, err := m.locateReadErrors(h, start, 65536, job, 200, sector)
+		if err != nil || len(ranges) != 1 {
+			t.Fatalf("sector=%d ranges=%+v err=%v", sector, ranges, err)
+		}
+		r := ranges[0]
+		if r.Offset != bad || r.Length != sector || r.Outcome != "unreadable" || r.Code != "EIO" || r.Recovered == nil || *r.Recovered || read != 65536-int(sector) {
+			t.Fatalf("incorrect block I/O localization: sector=%d range=%+v read=%d", sector, r, read)
+		}
+		if r.Evidence != nil {
+			t.Fatal("ordinary EIO fabricated a device protocol response")
+		}
+	}
+}
+
 func TestScanHierarchicalLocationAndTransientRecovery(t *testing.T) {
 	m := newTestManager(t, JobManagerOptions{})
 	job := &Job{ID: "locate", Status: "running"}
@@ -202,7 +231,7 @@ func TestFullScanRechecksWithoutDoubleCountingCoverage(t *testing.T) {
 			t.Fatalf("full coverage/recheck skipped: request %d offset %d want %d", i, offset, want)
 		}
 	}
-	if r.Map[0].Recheck == nil || r.Map[0].Recheck.BytesRead != 2*scanLatencyRequestBytes || r.Map[0].Status != "severe" || r.Map[0].MaxReadLatency == nil || r.Map[0].MaxReadLatency.Ms < 400 {
+	if r.Map[0].Recheck == nil || r.Map[0].Recheck.BytesRead != 2*scanLatencyRequestBytes || r.Map[0].Status != "slower" || r.Map[0].MaxReadLatency == nil || r.Map[0].MaxReadLatency.Ms < 400 {
 		t.Fatalf("lost original slow verdict: %+v", r.Map[0])
 	}
 	if len(r.Diagnostics.Increased) != 1 || r.Diagnostics.Increased[0] != "pending" || !strings.Contains(job.Message, "计数增长") {

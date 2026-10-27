@@ -5,11 +5,43 @@ import (
 	"errors"
 	"io"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
 
 type silentLogger struct{}
+
+func TestReleaseStaticScriptsFollowCSPAndRefreshUnversionedFiles(t *testing.T) {
+	public := t.TempDir()
+	if err := os.Mkdir(filepath.Join(public, "assets"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	for name, content := range map[string]string{
+		"index.html": "<!doctype html><script src=\"/app/diskbench/theme-init.js\"></script>",
+		"theme-init.js": "document.documentElement.dataset.theme = 'dark';",
+		"assets/index-012345.js": "console.log('built');",
+	} {
+		if err := os.WriteFile(filepath.Join(public, filepath.FromSlash(name)), []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	handler := newAPIServer(apiServerOptions{PublicDir: public})
+	for _, test := range []struct{ name, cache string }{
+		{"/", "no-store"}, {"/theme-init.js", "no-store"}, {"/assets/index-012345.js", "public, max-age=31536000, immutable"},
+	} {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest("GET", "/app/diskbench"+test.name, nil))
+		if response.Code != 200 || response.Header().Get("Cache-Control") != test.cache {
+			t.Fatalf("%s: status=%d cache=%q", test.name, response.Code, response.Header().Get("Cache-Control"))
+		}
+		csp := response.Header().Get("Content-Security-Policy")
+		if !strings.Contains(csp, "script-src 'self'") || strings.Contains(csp, "unsafe-inline") {
+			t.Fatalf("unexpected production script policy: %s", csp)
+		}
+	}
+}
 
 func (silentLogger) Errorf(string, ...interface{}) {}
 
@@ -367,7 +399,7 @@ func TestHealthReportsUnavailableWithoutLsblk(t *testing.T) {
 		t.Errorf("ok = true, want false")
 	}
 	caps, _ := body["capabilities"].(map[string]interface{})
-	if caps["scan"] != false || caps["dd"] != true {
+	if caps["scan"] != false || caps["dd"] != true || caps["recordedRepair"] != true {
 		t.Errorf("capabilities = %v", caps)
 	}
 	plan, _ := body["testPlan"].(map[string]interface{})

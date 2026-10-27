@@ -5,6 +5,7 @@ const assert = require("node:assert/strict");
 
 let jobBelongsToDisk;
 let findCurrentDiskForJob;
+let findLatestScanJob;
 let findResumableScan;
 let mergeJobLists;
 let mergeScanProgress;
@@ -27,14 +28,27 @@ let buildSpeedTargets;
 let jobBelongsToSpeedTarget;
 let rawSpeedDiskBlockedReason;
 let scanOutcomeSummary;
+let scanIssueDisplayCount;
+let scanAbnormalCellCount;
+let scanBadBlockSummary;
+let scanBadBlockKind;
+let scanRepairOutcomeLabel;
+let scanRepairStages;
+let scanRepairSpeedNote;
 let scanRangeOutcomeLabel;
+let mergeTimeoutSkipRanges;
+let scanRangeLocation;
+let scanCellLocationSummary;
 let validScanIssuePage;
 let scanRepairDiskBlockedReason;
+let recordedRepairCandidates;
+let isCompleteRecordedRepairResult;
 
 test.before(async () => {
   ({
     jobBelongsToDisk,
     findCurrentDiskForJob,
+    findLatestScanJob,
     findResumableScan,
     mergeJobLists,
     mergeScanProgress,
@@ -57,9 +71,21 @@ test.before(async () => {
     jobBelongsToSpeedTarget,
     rawSpeedDiskBlockedReason,
     scanOutcomeSummary,
+    scanIssueDisplayCount,
+    scanAbnormalCellCount,
+    scanBadBlockSummary,
+    scanBadBlockKind,
+    scanRepairOutcomeLabel,
+    scanRepairStages,
+    scanRepairSpeedNote,
     scanRangeOutcomeLabel,
+    mergeTimeoutSkipRanges,
+    scanRangeLocation,
+    scanCellLocationSummary,
     validScanIssuePage,
-    scanRepairDiskBlockedReason
+    scanRepairDiskBlockedReason,
+    recordedRepairCandidates,
+    isCompleteRecordedRepairResult
   } = await import("../../frontend/src/job-model.js"));
 });
 
@@ -217,6 +243,37 @@ test("pending jobs on serialless disks retain their current path identity", () =
   assert.equal(findCurrentDiskForJob([currentDisk], pending), currentDisk);
 });
 
+test("reopening restores the latest scan summary and follows its disk after a path change", () => {
+  const scannedDisk = disk({ path: "/dev/sdc" });
+  const disks = [disk({ serial: "OTHER", model: "Other disk" }), scannedDisk];
+  const old = job({ id: "old", type: "scan", status: "completed", historyOrder: 1 });
+  const latest = { ...old, id: "latest", historyOrder: 3, options: { scanMode: "full" } };
+  const speed = { ...old, id: "speed", type: "speed", historyOrder: 4 };
+  const restored = findLatestScanJob([old, speed, latest], disks);
+  assert.equal(restored, latest);
+  assert.equal(findCurrentDiskForJob(disks, restored), scannedDisk);
+  assert.equal(chooseShownJob({ activeJob: null, selectedJob: restored, modeJobs: [], mode: "scan" }), latest);
+  assert.equal(Object.hasOwn(restored, "result"), false); // The normal detail loader fetches this result.
+});
+
+test("reopening prioritizes running tasks and never assigns history to a replacement disk", () => {
+  const latest = job({ id: "scan", type: "scan", status: "completed", historyOrder: 3 });
+  assert.equal(findLatestScanJob([latest], [disk({ serial: "REPLACEMENT" })]), null);
+  for (const status of ["queued", "running", "cancelling"]) {
+    assert.equal(findLatestScanJob([latest, { id: "active", type: "speed", status }], [disk()]), null);
+  }
+  assert.equal(findLatestScanJob([], [disk()]), null);
+  assert.equal(findLatestScanJob([latest], []), null);
+  assert.equal(findLatestScanJob(null, [disk()]), null);
+});
+
+test("reopening can recover an interrupted scan and orders legacy history by creation time", () => {
+  const old = job({ id: "old", type: "scan", status: "completed", createdAt: "2026-10-14T10:00:00Z" });
+  const interrupted = { ...old, id: "interrupted", status: "interrupted", createdAt: "2026-10-15T10:00:00Z" };
+  assert.equal(findLatestScanJob([old, interrupted], [disk()]), interrupted);
+  assert.equal(findLatestScanJob([interrupted, old], [disk()]), interrupted);
+});
+
 test("speed targets map physical array members to the same storage space", () => {
   const spaces = [
     { path: "/vol1", members: ["/dev/sda"] },
@@ -367,6 +424,21 @@ test("seven display groups preserve legacy verdicts and split normalized results
   ]) assert.equal(scanStatusGroup(status, ms), expected, `${status}: ${ms}`);
 });
 
+test("media display bands agree with scan verdicts and preserve older history", () => {
+  for (const [basis, ms, expected] of [
+    ["hdd-dual-v4", 150, "slow"], ["hdd-dual-v4", 199.99, "slow"],
+    ["hdd-dual-v4", 200, "slower"], ["hdd-write-dual-v4", 175, "slow"],
+    ["solid-dual-v4", 49.99, "slow"], ["solid-dual-v4", 50, "slower"],
+    ["solid-write-dual-v4", 50, "slower"],
+    ["hdd-dual-v3", 175, "slower"], ["solid-dual-v2", 100, "slow"]
+  ]) assert.equal(scanStatusGroup("slow", ms, basis), expected, `${basis}: ${ms}`);
+  for (const basis of ["hdd-dual-v4", "solid-dual-v4"]) {
+    for (const status of ["slower", "severe", "error"]) {
+      assert.equal(scanStatusGroup(status, 1, basis), status);
+    }
+  }
+});
+
 test("scan map indexes and byte ranges must be ordered, positive, and contiguous", () => {
   const valid = [
     { index: 0, start: 0, end: 4096, status: "under5" },
@@ -424,6 +496,45 @@ test("scan map optional numeric fields must be finite and non-negative", () => {
   }
   assert.deepEqual(safeScanMap([{ ...base, sampleStart: 0, sampleEnd: Number.POSITIVE_INFINITY }]), []);
   assert.deepEqual(safeScanMap([{ ...base, sampleStart: 0 }]), []);
+});
+
+test("recorded repair selects exact slow reads and excludes unreadable or untested addresses", () => {
+  const map = Array.from({ length: SCAN_CELL_COUNT }, (_, index) => scanCell(index, "full", {
+    readOutcome: "readable", maxReadLatency: { ms: index < 2 ? 500 : 1, bytes: 512, offset: index * SCAN_CELL_SIZE }
+  }));
+  const job = completedScan({ map, result: { version: 2 } });
+  job.disk.logicalSectorSize = 512;
+  assert.equal(recordedRepairCandidates(job, 500).length, 2);
+  assert.equal(recordedRepairCandidates(job, 501).length, 0);
+  assert.equal(recordedRepairCandidates({ ...job, status: "cancelled" }, 500).length, 0);
+  assert.equal(recordedRepairCandidates({ ...job, options: { scanRepairFrom: "source" } }, 500).length, 0);
+  for (const patch of [{ errorCount: 1 }, { skippedBytes: 512, unresolvedBytes: 512 }, { readOutcome: "unreadable" }, { maxReadLatency: undefined }]) {
+    const changed = structuredClone(job);
+    Object.assign(changed.result.map[0], patch);
+    assert.equal(recordedRepairCandidates(changed, 500).some((cell) => cell.index === 0), false);
+  }
+  const sampled = structuredClone(job);
+  sampled.result.coverage = "sampled";
+  for (const cell of sampled.result.map) { cell.sampleStart = cell.start + 1024; cell.sampleEnd = cell.start + 1536; }
+  assert.equal(recordedRepairCandidates(sampled, 500).length, 0);
+});
+
+test("targeted repair completion requires every selected range and final write result", () => {
+  const job = { type: "scan", status: "completed", disk: { size: 4096, logicalSectorSize: 512 }, options: { scanRepairFrom: "source" }, result: {
+    coverage: "targeted", repairTargets: [{ cellIndex: 8, read: { offset: 512, bytes: 512, ms: 500 } }],
+    map: [{ index: 0, start: 512, end: 1024, status: "normal" }],
+    stats: { testedCells: 1, issuesComplete: true, repair: { candidates: 1, pending: 0, verified: 1, stillSlow: 0, skipped: 0, failed: 0, writtenBytes: 512 } }
+  } };
+  assert.equal(isCompleteRecordedRepairResult(job), true);
+  for (const patch of [{ pending: 1 }, { verified: 0 }, { candidates: 2 }]) {
+    const changed = structuredClone(job);
+    Object.assign(changed.result.stats.repair, patch);
+    assert.equal(isCompleteRecordedRepairResult(changed), false);
+  }
+  const changed = structuredClone(job);
+  changed.result.map[0].end++;
+  assert.equal(isCompleteRecordedRepairResult(changed), false);
+  assert.equal(isCompleteScanResult(job), false);
 });
 
 test("deep scan history retains independent read and write latency verdicts", () => {
@@ -842,6 +953,197 @@ test("scan outcome counters preserve recovery and reject incomplete address acco
   assert.equal(scanOutcomeSummary(job), null);
 });
 
+test("issue entry counts repair attempts once, including interrupted results", () => {
+  const job = { type: "scan", disk: { size: 8192 }, result: { version: 2, stats: {
+    issueCount: 7, savedIssueCount: 7, unreadableRanges: 1, recoveredRanges: 1,
+    repair: { candidates: 3, verified: 1, pending: 1, skipped: 1 }, issuesComplete: true
+  } } };
+  assert.equal(scanIssueDisplayCount(job), 5);
+  job.result.stats.issueCount = job.result.stats.savedIssueCount = 6;
+  assert.equal(scanIssueDisplayCount(job), 5);
+  delete job.result.stats.repair;
+  assert.equal(scanIssueDisplayCount(job), 6);
+  assert.equal(scanIssueDisplayCount({ result: { stats: { badRanges: [{ code: "EIO" }] } } }), 1);
+});
+
+test("timeout display counts and rows combine a skipped suffix without claiming bad sectors", () => {
+  const range = {offset:3391592*512,length:512*1024,code:"TIMEOUT",outcome:"device_error",recovered:false,
+    skippedRange:{offset:3391848*512,length:384*1024}};
+  const page = {offset:0,next:1,total:1,complete:true,legacy:false,records:[range]};
+  assert.equal(validScanIssuePage(page,2**40,0),true);
+  assert.equal(scanRangeOutcomeLabel(range),"读取超时，已跳过");
+  assert.equal(scanRangeLocation(range,512).precision,"request");
+  assert.equal(scanRangeLocation(range,512).label,"请求范围 · 跳过部分待定位");
+  const failed={...range,skippedRange:undefined};
+  const skipped={...range.skippedRange,code:"SLOW_READ_LIMIT",outcome:"unresolved",unresolvedBytes:384*1024};
+  const records=[failed,skipped];
+  assert.deepEqual(mergeTimeoutSkipRanges(records),[range]);
+  assert.equal(records[0].skippedRange,undefined);
+  const unrelated={offset:0,length:512,code:"EIO",outcome:"unreadable"};
+  assert.equal(mergeTimeoutSkipRanges([failed,unrelated,skipped]).length,3);
+  assert.equal(mergeTimeoutSkipRanges([failed]).length,1);
+  for (const patch of [{skippedRange:{}},{skippedRange:{offset:range.offset-512,length:512}},{skippedRange:{...range.skippedRange,length:0}},
+    {skippedRange:{...range.skippedRange,length:range.skippedRange.length-512}},{outcome:"unreadable"},{recovered:true},{code:"EIO"}]) {
+    assert.equal(validScanIssuePage({...page,records:[{...range,...patch}]},2**40,0),false);
+  }
+  const job={type:"scan",disk:{size:2**40},result:{version:2,stats:{issueCount:2,savedIssueCount:2,issuesComplete:true,
+    deviceErrorRanges:1,unresolvedRanges:1,timeoutSkipPairs:1,repair:{candidates:0}}}};
+  assert.equal(scanIssueDisplayCount(job),1);
+  delete job.result.stats.repair;
+  assert.equal(scanIssueDisplayCount(job),1);
+  job.result.stats.timeoutSkipPairs=2;
+  assert.equal(scanOutcomeSummary(job),null);
+});
+
+test("severe successful reads count as abnormal without requiring read failures", () => {
+  const map = Array.from({ length: SCAN_CELL_COUNT }, (_, index) => scanCell(index, "full", {
+    status: index === 1 ? "severe" : index === 2 ? "over500" : index === 3 ? "slow" : "normal",
+    coveredBytes: SCAN_CELL_SIZE, readOutcome: "readable"
+  }));
+  const job = completedScan({ map, result: { version: 2, stats: scanStats(map, { coveredBytes: SCAN_DISK_SIZE, issuesComplete: true }) } });
+  assert.equal(isCompleteScanResult(job), true);
+  assert.equal(job.result.stats.errorCells, 0);
+  assert.equal(scanAbnormalCellCount(map), 2);
+  assert.equal(scanIssueDisplayCount(job), 2);
+  assert.equal(scanAbnormalCellCount([...map, { status: "error", errorCount: 3 }, { status: "slower" }, { status: "pending" }, { status: "reading" }]), 3);
+  assert.equal(scanAbnormalCellCount(undefined), 0);
+});
+
+test("severe detail pages retain timing evidence and validate its range", () => {
+  const range = { offset: 512, length: 512, probeBytes: 512, code: "SEVERE_SLOW_READ", outcome: "severe", detail: "最慢单次读取 1962.0 ms；复测 1940.0 ms" };
+  const page = { offset: 0, next: 1, total: 1, complete: true, legacy: false, records: [range] };
+  assert.equal(validScanIssuePage(page, 4096, 0), true);
+  assert.equal(scanRangeOutcomeLabel(range), "严重慢读（待确认）");
+  for (const patch of [{ detail: "" }, { detail: 1962 }, { code: "EIO" }, { offset: 4096 }, { length: 0 }]) {
+    assert.equal(validScanIssuePage({ ...page, records: [{ ...range, ...patch }] }, 4096, 0), false);
+  }
+});
+
+test("issue addresses use recorded logical sectors and never inflate range errors into confirmed sectors", () => {
+  const range = { offset: 3 * 1024 ** 4 + 4096, length:4096, probeBytes:4096, outcome:"unreadable", code:"EIO", recovered:false };
+  const exact = scanRangeLocation(range, 4096);
+  assert.equal(exact.startLba, range.offset / 4096);
+  assert.equal(exact.endLba, exact.startLba);
+  assert.equal(exact.label, "逐扇区确认");
+  assert.equal(exact.sectorBytes, 4096);
+  const coarse = scanRangeLocation(range, 512);
+  assert.equal(coarse.endLba - coarse.startLba, 7);
+  assert.equal(coarse.label, "范围确认（未逐扇区）");
+  for (const patch of [{probeBytes:undefined}, {probeBytes:0}, {probeBytes:512}, {recovered:undefined}, {recovered:true}, {offset:range.offset+512}, {outcome:undefined}]) {
+    assert.equal(scanRangeLocation({...range,...patch},4096).precision,"unknown");
+  }
+  const unknownSector = scanRangeLocation(range, undefined);
+  assert.equal(unknownSector.startLba, null);
+  assert.equal(unknownSector.endLba, null);
+  assert.equal(unknownSector.precision, "unknown");
+  for (const code of ["LOCALIZATION_LIMIT", "SLOW_READ_LIMIT"]) {
+    assert.equal(scanRangeLocation({...range,code,outcome:"unresolved"},4096).precision,"unresolved");
+  }
+  for (const outcome of ["recovered", "device_error", "severe", "rewrite"]) {
+    assert.equal(scanRangeLocation({...range,outcome},4096).precision,"request");
+  }
+});
+
+test("region location summary distinguishes skipped ranges, limits and confirmed sector evidence", () => {
+  const skipped = {offset:440790016,length:524288,unresolvedBytes:524288,code:"SLOW_READ_LIMIT",outcome:"unresolved"};
+  const cell = {status:"error",errorCount:1,unresolvedBytes:524288,skippedBytes:524288};
+  assert.equal(scanCellLocationSummary(cell,[skipped],512),"未完成 · 卡读跳过");
+  assert.equal(scanCellLocationSummary({...cell,skippedBytes:0},[{...skipped,code:"LOCALIZATION_LIMIT"}],512),"未完成 · 定位限额已到");
+  assert.equal(scanCellLocationSummary({...cell,skippedBytes:0},[],512),"定位未完成");
+  const sector = {offset:73*512,length:512,probeBytes:512,code:"EIO",outcome:"unreadable",recovered:false};
+  // The preview can be truncated or contain repeated observations; do not infer a total sector count.
+  assert.equal(scanCellLocationSummary({status:"error",unreadableBytes:512},[sector,sector],512),"已定位到坏扇区");
+  assert.equal(scanCellLocationSummary(cell,[sector,skipped],512),"已定位到坏扇区 · 其余待定位");
+  const coarse = {...sector,offset:65536,length:65536,probeBytes:65536};
+  assert.equal(scanCellLocationSummary({status:"error",unreadableBytes:65536},[coarse],512),"已确认不可读范围 · 未细分到扇区");
+  assert.equal(scanCellLocationSummary({status:"error",unreadableBytes:512},[{...sector,probeBytes:undefined}],512),"旧记录未保存定位精度");
+  assert.equal(scanCellLocationSummary({status:"error",errorCount:1},[],512),"未确认坏扇区 · 查看读取异常");
+  assert.equal(scanCellLocationSummary({status:"reading"},[],512),"尚未完成检测");
+  assert.equal(scanCellLocationSummary(null,null,512),"尚未完成检测");
+  assert.equal(scanCellLocationSummary({status:"normal",bytesRead:524288},[],512),"本次已读范围未发现不可读扇区");
+});
+
+test("usability bad blocks combine persistent slow and unreadable regions without counting transient or busy reads", () => {
+  const proof = { offset:512,bytes:512,firstMs:500,repeatMs:500,source:"recheck",load:{backgroundActivity:false} };
+  const slow = { start:0,end:4096,status:"severe",readOutcome:"readable",slowBadBlock:proof };
+  const unreadable = { start:4096,end:8192,status:"error",unreadableBytes:512,readOutcome:"unreadable" };
+  const transient = { start:8192,end:12288,status:"severe",maxReadLatency:{offset:8192,bytes:512,ms:1000},recheck:{maxReadLatency:{offset:8192,bytes:512,ms:1000},load:{backgroundActivity:false}} };
+  assert.deepEqual(scanBadBlockSummary([slow,unreadable,transient,{status:"error",readOutcome:"device_error"}]),{total:2,slow:1,unreadable:1});
+  assert.deepEqual(scanBadBlockSummary([{...slow,unreadableBytes:512}]),{total:1,slow:0,unreadable:1});
+  for(const patch of [{repeatMs:1},{load:null},{load:{backgroundActivity:true}},{offset:4096},{firstMs:NaN}]) {
+    assert.equal(scanBadBlockKind({...slow,slowBadBlock:{...proof,...patch}}),"");
+  }
+  assert.equal(scanBadBlockKind(slow,true),"");
+  assert.equal(scanBadBlockKind({...slow,slowBadBlock:{...proof,firstMs:800,repeatMs:800}},true),"slow");
+  assert.equal(scanBadBlockKind(transient),"");
+  const range = {offset:512,length:512,code:"PERSISTENT_SLOW_READ",outcome:"severe",detail:"同范围两次超限，未检测到并发磁盘活动"};
+  assert.equal(scanRangeOutcomeLabel(range),"坏块（慢速）");
+  assert.equal(scanRangeOutcomeLabel({outcome:"unreadable"}),"坏块（不可读）");
+  assert.equal(validScanIssuePage({offset:0,next:1,total:1,complete:true,legacy:false,records:[range]},4096,0),true);
+});
+
+test("repair verification and speed improvement have distinct labels and require repeat evidence",()=>{
+  assert.equal(scanRepairOutcomeLabel({outcome:"verified"}),"写回校验通过");
+  assert.equal(scanRepairOutcomeLabel({outcome:"verified",speedOutcome:"improved"}),"慢速改善 · 写回校验通过");
+  assert.equal(scanRepairOutcomeLabel({outcome:"still_slow"}),"修复后仍慢");
+  const range={offset:512,length:512,code:"SLOW_REWRITE_VERIFIED",outcome:"rewrite",repair:{outcome:"verified",speedOutcome:"improved",beforeMs:501,currentBeforeMs:501,beforeRepeatMs:510,speedChecks:[10,11],speedLoad:{backgroundActivity:false},beforeLoad:{backgroundActivity:false},writtenBytes:512}};
+  const page={offset:0,next:1,total:1,complete:true,legacy:false,records:[range]};
+  assert.equal(validScanIssuePage(page,4096,0),true);
+  for(const patch of [{speedChecks:[10]},{speedLoad:null},{beforeLoad:{backgroundActivity:true}},{speedChecks:[10,-1]}]) {
+    assert.equal(validScanIssuePage({...page,records:[{...range,repair:{...range.repair,...patch}}]},4096,0),false);
+  }
+});
+
+test("repair stages expose recorded retests when the pre-write read already recovered", () => {
+  const repair = { outcome:"verified", speedOutcome:"unconfirmed", beforeMs:4336.802022,
+    currentBeforeMs:4336.802022, beforeRepeatMs:0.692134, speedChecks:[0.423214,0.36838], afterMs:0.423214,
+    beforeLoad:{backgroundActivity:false}, speedLoad:{backgroundActivity:false} };
+  const stages = scanRepairStages(repair);
+  assert.deepEqual(stages.map((s) => s.label), ["首次","修复前","写回","复测"]);
+  assert.equal(stages[1].ms, 0.692134);
+  assert.deepEqual(stages[3].values, [0.423214,0.36838]);
+  assert.equal(scanRepairSpeedNote(repair, 500), "修复前已恢复");
+  assert.equal(scanRepairSpeedNote({...repair, speedChecks:[0.4,510]},500), "复测波动");
+  assert.equal(scanRepairSpeedNote({...repair, speedLoad:null},500), "复测负载未知");
+  assert.equal(scanRepairSpeedNote({...repair, speedLoad:{backgroundActivity:true}},500), "复测有其他磁盘活动");
+  const legacy = {outcome:"verified", beforeMs:4337, afterMs:0.4};
+  assert.deepEqual(scanRepairStages(legacy).at(-1), {label:"复测",text:"未记录"});
+  assert.equal(scanRepairSpeedNote(legacy,500), "复测未记录");
+  const interrupted = {...repair, outcome:"uncertain"};
+  assert.deepEqual(scanRepairStages(interrupted).at(-1), {label:"复测",text:"未完成"});
+  assert.equal(scanRepairStages({...repair,outcome:"failed"}).at(-1).text,"未通过");
+});
+
+test("completed slow skips preserve planned coverage without claiming skipped bytes were read", () => {
+  for (const coverage of ["full", "sampled"]) {
+    const target = coverage === "full" ? SCAN_CELL_SIZE : QUICK_SAMPLE_SIZE;
+    const skippedBytes = target - 512;
+    const map = Array.from({ length: SCAN_CELL_COUNT }, (_, index) => scanCell(index, coverage, {
+      status: index === 0 ? "severe" : "normal", readOutcome: index === 0 ? "unresolved" : "readable",
+      bytesRead: index === 0 ? 512 : target, coveredBytes: index === 0 ? 512 : target,
+      unresolvedBytes: index === 0 ? skippedBytes : 0, skippedBytes: index === 0 ? skippedBytes : 0
+    }));
+    const range = { offset: (map[0].sampleStart || 0) + 512, length: skippedBytes, code: "SLOW_READ_LIMIT", outcome: "unresolved", unresolvedBytes: skippedBytes, detail: "严重卡读，已跳过；未完成读取检测" };
+    const stats = scanStats(map, { coveredBytes: SCAN_CELL_COUNT * target - skippedBytes, skippedBytes, unresolvedBytes: skippedBytes,
+      issueCount: 1, savedIssueCount: 1, unresolvedRanges: 1, issuesComplete: true, badRanges: [range] });
+    const job = completedScan({ coverage, map, result: { version: 2, stats } });
+    assert.equal(isCompleteScanResult(job), true);
+    assert.equal(stats.errorCells, 0);
+    assert.equal(scanAbnormalCellCount(map), 1);
+    assert.equal(scanIssueDisplayCount(job), 1);
+    assert.equal(scanOutcomeSummary(job).skippedBytes, skippedBytes);
+    assert.equal(scanRangeOutcomeLabel(range), "严重卡读，已跳过");
+    const page = { offset: 0, next: 1, total: 1, complete: true, legacy: false, records: [range] };
+    assert.equal(validScanIssuePage(page, SCAN_DISK_SIZE, 0), true);
+    for (const patch of [{ skippedBytes: 0 }, { skippedBytes: skippedBytes + 1 }, { coveredBytes: SCAN_CELL_COUNT * target }]) {
+      assert.equal(isCompleteScanResult({ ...job, result: { ...job.result, stats: { ...stats, ...patch } } }), false);
+    }
+    for (const patch of [{ detail: "" }, { unresolvedBytes: skippedBytes - 1 }, { outcome: "unreadable" }]) {
+      assert.equal(validScanIssuePage({ ...page, records: [{ ...range, ...patch }] }, SCAN_DISK_SIZE, 0), false);
+    }
+  }
+});
+
 test("new completed scans require full planned coverage and complete record persistence", () => {
   const map = Array.from({ length: SCAN_CELL_COUNT }, (_, index) => scanCell(index, "full", { coveredBytes: SCAN_CELL_SIZE, readOutcome: "readable" }));
   const job = completedScan({ map, result: { version: 2 } });
@@ -869,9 +1171,12 @@ test("issue pages preserve uncertain legacy evidence and validate exact page bou
 
 test("slow repair requires an identified offline writable disk", () => {
   const disk = { path: "/dev/sda", serial: "TEST", logicalSectorSize:512, fileSystems: ["ext4"], mountpoints: [], readOnly: false, isSystem: false };
-  assert.equal(scanRepairDiskBlockedReason(disk), "");
-  for (const patch of [{serial:""},{logicalSectorSize:0},{isSystem:true},{readOnly:true},{mountpoints:["/vol1"]},{fileSystems:["linux_raid_member"]},{fileSystems:["zfs_member"]},{fileSystems:["LVM2_member"]},{fileSystems:["swap"]}]) {
+  for (const fileSystems of [["ext4"], [], ["unknown"], ["zfs_member"], ["ZFS_MEMBER", "ext4"]]) {
+    assert.equal(scanRepairDiskBlockedReason({...disk,fileSystems}), "");
+  }
+  for (const patch of [{serial:""},{logicalSectorSize:0},{isSystem:true},{readOnly:true},{mountpoints:["/vol1"]},{fileSystems:["linux_raid_member"]},{fileSystems:["zfs_member", "LVM2_member"]},{fileSystems:["LVM2_member"]},{fileSystems:["crypto_LUKS"]},{fileSystems:["bcache"]},{fileSystems:["swap"]}]) {
     assert.notEqual(scanRepairDiskBlockedReason({...disk,...patch}), "");
+    assert.notEqual(scanRepairDiskBlockedReason({...disk,fileSystems:["zfs_member"],...patch}), "");
   }
 });
 

@@ -25,7 +25,7 @@ func scanCellComplete(result *ScanResult, cell *ScanCell) bool {
 }
 
 func scanResumeInfo(job *Job) *ScanResumeInfo {
-	if job == nil || job.Type != "scan" || (job.Status != "cancelled" && job.Status != "interrupted") || job.Disk.Serial == "" {
+	if job == nil || job.Type != "scan" || job.Options.ScanRepairFrom != "" || (job.Status != "cancelled" && job.Status != "interrupted") || job.Disk.Serial == "" {
 		return nil
 	}
 	r, ok := job.Result.(*ScanResult)
@@ -51,7 +51,7 @@ func scanResumeInfo(job *Job) *ScanResumeInfo {
 	index, sawIncomplete, observed := 0, false, false
 	for i := range r.Map {
 		c := &r.Map[i]
-		if c.Index != i || c.Start != want[i].Start || c.End != want[i].End || c.BytesRead < 0 || c.CoveredBytes < 0 || c.UnresolvedBytes < 0 {
+		if c.Index != i || c.Start != want[i].Start || c.End != want[i].End || c.BytesRead < 0 || c.CoveredBytes < 0 || c.UnresolvedBytes < 0 || c.SkippedBytes < 0 || c.SkippedBytes > c.UnresolvedBytes {
 			return nil
 		}
 		switch c.Status {

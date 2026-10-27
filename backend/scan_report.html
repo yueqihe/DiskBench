@@ -1,0 +1,50 @@
+{{define "header"}}<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="{{.CSP}}">
+<title>{{.Mode}}报告 · {{.Job.Disk.Model}} · Disk Bench</title>
+<style>{{reportStyle}}</style>
+</head>
+<body>
+<div class="tools"><span>单文件离线报告 · 可直接分享与归档</span><button type="button" id="print-report">打印 / 保存为 PDF</button></div>
+<main class="paper">
+  <header class="masthead"><div class="brand"><span class="brand-mark" aria-hidden="true"></span>Disk Bench<span class="brand-note">磁盘检测报告</span></div><div class="generated">生成于 {{.Generated}}</div></header>
+  <div class="report-title"><p class="eyebrow">{{.Mode}} / {{.Status}}</p><h1>{{if .Job.Options.ScanRepairFrom}}硬盘慢区修复报告{{else}}硬盘扫描检测报告{{end}}</h1><p class="disk-name">{{.Job.Disk.Model}}</p><p class="report-id">报告编号 {{.Job.ID}}</p></div>
+  {{if .Mock}}<p class="notice warning"><strong>演示数据</strong> 本报告未对真实硬盘执行检测，不能用于判断实际硬盘状态。</p>{{end}}
+  <section class="verdict {{.Tone}}" aria-label="检测结论"><span class="verdict-label">检测结论</span><h2>{{.Verdict}}</h2><p>{{.Explanation}}</p></section>
+  {{if ne .Job.Status "completed"}}<p class="notice warning"><strong>未完成的扫描快照。</strong> 任务状态：{{.Status}}。后续地址尚未完成检测，当前结果不能代表整盘。</p>{{end}}
+  {{if .Warning}}<p class="notice warning"><strong>记录完整性提示：</strong>{{.Warning}}</p>{{end}}
+  {{if .Job.PersistenceWarning}}<p class="notice warning"><strong>保存告警：</strong>{{.Job.PersistenceWarning}}</p>{{end}}
+  <section class="section"><div class="section-heading"><span>01</span><h2>硬盘信息</h2></div><p class="section-note">以下信息来自本次扫描保存的硬盘快照。</p><dl class="fields">{{range .Identity}}<div><dt>{{.Label}}</dt><dd>{{.Value}}</dd></div>{{end}}</dl></section>
+  <section class="section"><div class="section-heading"><span>02</span><h2>{{if .Job.Options.ScanRepairFrom}}修复概况{{else}}扫描概况{{end}}</h2></div>
+    <div class="metrics">{{range .Metrics}}<div class="metric"><span>{{.Label}}</span><strong>{{.Value}}</strong><small>{{.Note}}</small></div>{{end}}</div>
+    <dl class="fields scan-fields">{{range .Config}}<div><dt>{{.Label}}</dt><dd>{{.Value}}</dd></div>{{end}}</dl>
+    <div class="distribution"><h3>区域检测结果分布</h3><svg class="distribution-bar" viewBox="0 0 1000 14" preserveAspectRatio="none" role="img" aria-label="各响应等级的扫描区域分布"><title>区域数量分布</title>{{range .Bands}}{{if .Count}}<rect x="{{.X}}" width="{{.Width}}" height="14" class="fill-{{.Key}}"><title>{{.Label}}：{{.Count}} 个区域</title></rect>{{end}}{{end}}</svg><ul class="legend">{{range .Bands}}<li><i class="fill-{{.Key}}" aria-hidden="true"></i>{{.Label}}<strong>{{.Count}}</strong></li>{{end}}</ul><p class="section-note">每个区域代表一段地址范围，区域数量不等于坏扇区数量；“严重”使用统一红色告警，包含坏块、待确认慢响应及读取异常。直接读取减少系统缓存影响；设备固件缓存仍可能影响结果，速度改善仅表示本次同范围复测恢复。</p></div>
+    {{if eq .Mode "快速抽样扫描"}}<p class="notice neutral"><strong>本次为抽样检测。</strong> 只对实际抽读的地址作出读取判定；扫描进度达到 100% 也不代表逐字节读过整盘。</p>{{end}}
+    {{if .Repair}}<div class="repair-summary"><h3>慢扇区写回结果 <span>阈值 {{.RepairThreshold}} ms</span></h3><p>候选 <strong>{{.Repair.Candidates}}</strong> · 写回校验通过 <strong>{{addInt .Repair.Verified .Repair.StillSlow}}</strong> · 慢速改善 <strong>{{.Repair.Improved}}</strong> · 修复后仍慢 <strong>{{.Repair.StillSlow}}</strong> · 跳过 <strong>{{.Repair.Skipped}}</strong> · 失败 <strong>{{.Repair.Failed}}</strong> · 待处理或结果未确定 <strong>{{.Repair.Pending}}</strong></p><p class="section-note">写回校验通过只表示读回内容一致；同范围连续复测恢复到门槛以内，才记为慢速改善。修复后仍慢的地址不再反复写入，建议更换硬盘。首次慢响应与原始数据备份保留。</p></div>{{end}}
+  </section>
+  <section class="section issue-section"><div class="section-heading"><span>03</span><h2>异常与修复明细</h2><span class="section-count">{{.IssueRows}} 条</span></div><p class="section-note">同一次超时及其跳过范围合并为一行；同一次修复合并为一行，列出首次、修复前及复测耗时。旧记录缺少复测数据时标注“未记录”。</p>
+  <p class="section-note">起止 LBA 均包含在范围内，从 0 编号，按本次记录的逻辑扇区大小换算。“逐扇区确认”表示已定位到单个不可读逻辑扇区；“范围确认”不代表范围内每个扇区均损坏；待定位范围不计为已确认坏扇区。未记录扇区大小时仅列字节地址。</p>
+  <div class="table-wrap"><table class="issue-table"><caption class="sr-only">扫描异常地址、定位精度及修复结果</caption><thead><tr><th scope="col">起止 LBA / 数据量</th><th scope="col">检测结果 / 定位精度</th><th scope="col" class="numeric">首次 / 修复前</th><th scope="col" class="numeric">写回 / 复测</th><th scope="col">说明</th></tr></thead><tbody>
+{{end}}
+{{define "issue"}}<tr><td class="address">{{.Address}}<small>{{.Size}}</small></td><td>{{.Outcome}}<small class="location-precision">{{.Precision}}{{if .Probe}}<br>{{.Probe}}{{end}}</small></td><td class="numeric">{{.Before}}{{if .BeforeRepair}}<div class="detail"><small>修复前 {{.BeforeRepair}}</small></div>{{end}}</td><td class="numeric">{{if .AfterLabel}}<div class="detail"><small>{{.AfterLabel}}</small></div>{{end}}{{.After}}</td><td class="detail">{{.Detail}}</td></tr>
+{{end}}
+{{define "footer"}}
+{{if not .IssueRows}}<tr><td colspan="5" class="empty">本次记录中没有可列出的异常或修复明细。{{if not .Complete}}记录不完整，不能据此认为没有异常。{{end}}</td></tr>{{end}}
+</tbody></table></div>
+<p class="record-status {{if not .Complete}}warning-text{{end}}">已列出 {{.IssueRows}} 条明细。{{if .Complete}}异常记录已完整读取。{{else}}异常记录不完整：{{.Warning}}{{end}}</p>
+  </section>
+  <section class="section"><div class="section-heading"><span>04</span><h2>慢响应与异常区域</h2><span class="section-count">共 {{.SlowCount}} 个</span></div>
+  {{if .SlowRows}}<p class="section-note">按最长响应排序，最多列出 20 个重点区域。耗时优先使用单次主机读取请求，旧记录显示整次读取耗时。</p><div class="table-wrap"><table><caption class="sr-only">最长响应区域</caption><thead><tr><th scope="col">区域</th><th scope="col">最慢请求地址 / 区域范围</th><th scope="col" class="numeric">最长响应 / 请求数据量</th><th scope="col">判定与复读</th></tr></thead><tbody>{{range .SlowRows}}<tr><td>{{.Region}}</td><td class="address">{{.Address}}</td><td class="numeric">{{.Latency}}</td><td>{{.Outcome}}</td></tr>{{end}}</tbody></table></div>{{else}}<p class="empty">本次已扫描区域未记录慢响应或读取异常。</p>{{end}}
+  </section>
+  <section class="section"><div class="section-heading"><span>05</span><h2>SMART / 设备日志</h2></div><p class="section-note">对比扫描前后保存的设备计数。未取得的数值显示为“未取得”，不按 0 处理。</p>
+  {{if .SmartRows}}<div class="table-wrap"><table class="smart-table"><caption class="sr-only">SMART 计数前后对比</caption><thead><tr><th scope="col">健康项目</th><th scope="col" class="numeric">扫描前</th><th scope="col" class="numeric">扫描后</th><th scope="col" class="numeric">本次变化</th></tr></thead><tbody>{{range .SmartRows}}<tr><th scope="row">{{.Label}}</th><td class="numeric">{{.Before}}</td><td class="numeric">{{.After}}</td><td class="numeric {{if .Increased}}danger-text{{end}}">{{.Change}}</td></tr>{{end}}</tbody></table></div>{{end}}
+  <ul class="evidence-notes">{{range .SmartNotes}}<li>{{.}}</li>{{end}}</ul></section>
+  <section class="section explanation"><div class="section-heading"><span>06</span><h2>结果说明</h2></div><ul><li>检测结果对应本次扫描的时间、参数和已读取范围，不能预测硬盘剩余寿命，也不构成厂商认证。</li><li>本项目按正常使用要求定义坏块：同范围重复读取持续超出延迟门槛记为“坏块（慢速）”；重试定位后仍不能完整读取记为“坏块（不可读）”。两者合并计入坏块区域，总数按区域去重，并保留原因。单次超限或并发负载未排除时保留告警。</li><li>异常明细中的范围按实际定位精度记录，不能推断范围内每个扇区都损坏。未完成扫描和不完整记录均不能作整盘无异常结论。</li><li>容量同时提供十进制单位（GB / TB）与二进制单位（GiB / TiB）；时间包含时区偏移。报告使用扫描时保存的信息，离线打开不依赖应用服务。</li></ul></section>
+  <footer class="report-footer"><strong>Disk Bench</strong><span>{{.Mode}}检测记录 · {{.Job.ID}}</span></footer>
+</main>
+<script>{{reportScript}}</script>
+</body></html>
+{{end}}

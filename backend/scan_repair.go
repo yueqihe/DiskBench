@@ -20,15 +20,22 @@ type RepairHandle interface {
 }
 
 type ScanRepairRecord struct {
-	Outcome      string   `json:"outcome"`
-	BeforeMs     float64  `json:"beforeMs"`
-	AfterMs      *float64 `json:"afterMs,omitempty"`
-	WrittenBytes int64    `json:"writtenBytes"`
-	BackupFile   string   `json:"backupFile,omitempty"`
-	Detail       string   `json:"detail,omitempty"`
+	SpeedOutcome    string    `json:"speedOutcome,omitempty"`
+	CurrentBeforeMs *float64  `json:"currentBeforeMs,omitempty"`
+	BeforeRepeatMs  *float64  `json:"beforeRepeatMs,omitempty"`
+	SpeedChecks     []float64 `json:"speedChecks,omitempty"`
+	SpeedLoad       *ScanLoad `json:"speedLoad,omitempty"`
+	BeforeLoad      *ScanLoad `json:"beforeLoad,omitempty"`
+	Outcome         string    `json:"outcome"`
+	BeforeMs        float64   `json:"beforeMs"`
+	AfterMs         *float64  `json:"afterMs,omitempty"`
+	WrittenBytes    int64     `json:"writtenBytes"`
+	BackupFile      string    `json:"backupFile,omitempty"`
+	Detail          string    `json:"detail,omitempty"`
 }
 
 type ScanRepairStats struct {
+	Improved     int64 `json:"improved,omitempty"`
 	Candidates   int64 `json:"candidates"`
 	Pending      int64 `json:"pending"`
 	Verified     int64 `json:"verified"`
@@ -91,7 +98,10 @@ func scanRepairBlockedReason(disk *Disk) string {
 	var blockedFileSystems []string
 	for _, fs := range disk.FileSystems {
 		kind := strings.ToLower(fs)
-		if strings.Contains(kind, "raid") || strings.Contains(kind, "lvm") || strings.Contains(kind, "luks") || strings.Contains(kind, "zfs") || strings.Contains(kind, "bcache") || kind == "swap" {
+		// A ZFS label may belong to an exported or abandoned pool. It does not
+		// establish current use. The Linux O_EXCL repair handle must succeed
+		// before scanning or writing, and rejects devices held by active ZFS.
+		if strings.Contains(kind, "raid") || strings.Contains(kind, "lvm") || strings.Contains(kind, "luks") || strings.Contains(kind, "bcache") || kind == "swap" {
 			blockedFileSystems = append(blockedFileSystems, strings.TrimSpace(fs))
 		}
 	}
@@ -153,6 +163,9 @@ func applyScanRepairStats(stats *ScanRepairStats, record *ScanRepairRecord) {
 		stats.Pending = max(0, stats.Pending-1)
 		if record.Outcome == "verified" {
 			stats.Verified++
+			if record.SpeedOutcome == "improved" {
+				stats.Improved++
+			}
 		} else if record.Outcome == "still_slow" {
 			stats.StillSlow++
 		} else {
@@ -229,13 +242,13 @@ func (m *JobManager) saveRepairBackup(job *Job, read ScanReadLatency, original [
 	return name, nil
 }
 
-func (m *JobManager) repairSlowRequests(job *Job, cell *ScanCell, handle RepairHandle, source []byte, start int64, region readRegionResult) error {
+func (m *JobManager) repairSlowRequests(job *Job, cell *ScanCell, handle RepairHandle, source []byte, start int64, region *readRegionResult) error {
 	threshold := scanRepairThreshold(job)
 	if threshold == 0 || handle == nil || region.errorCount != 0 || region.bytesRead != len(source) {
 		return nil
 	}
 	for _, sample := range region.slowReads {
-		if sample.Ms <= threshold {
+		if sample.Ms < threshold || (sample.Ms == threshold && job.Options.ScanRepairFrom == "") {
 			continue
 		}
 		sector := job.Disk.LogicalSectorSize
@@ -263,7 +276,11 @@ func (m *JobManager) repairSlowRequests(job *Job, cell *ScanCell, handle RepairH
 		original := scanBuffer(sample.Bytes)
 		copy(original, source[int(index):int(index)+sample.Bytes])
 		check := scanBuffer(sample.Bytes)
+		beforeLoad := m.newScanLoadMonitor(job.Device)
+		beforeStarted := time.Now()
 		n, err := m.readScanRequest(job, handle, check, sample.Offset)
+		beforeMs := float64(time.Since(beforeStarted).Nanoseconds()) / 1e6
+		beforeActivity := beforeLoad.observe(int64(max(0, n)), true)
 		if err != nil || n != len(check) || !bytes.Equal(original, check) {
 			detail := "复读不完整或数据与首次读取不同，跳过写入"
 			if logErr := m.recordRepairEvent(job, cell, sample, ScanRepairRecord{Outcome: "skipped", BeforeMs: sample.Ms, Detail: detail}); logErr != nil {
@@ -279,11 +296,31 @@ func (m *JobManager) repairSlowRequests(job *Job, cell *ScanCell, handle RepairH
 			return fmt.Errorf("修复备份保存失败，未提交写入：%w", err)
 		}
 		pending := ScanRepairRecord{Outcome: "pending", BeforeMs: sample.Ms, BackupFile: backup}
+		currentBefore := sample.Ms
+		if job.Options.ScanRepairFrom != "" && cell.MaxReadLatency != nil {
+			currentBefore = cell.MaxReadLatency.Ms
+		}
+		pending.CurrentBeforeMs, pending.BeforeRepeatMs = &currentBefore, &beforeMs
+		pending.BeforeLoad = beforeActivity
 		if err := m.recordRepairEvent(job, cell, sample, pending); err != nil {
 			return err
 		}
 		if err := syncRepairBackupDirectory(m.jobsDir); err != nil {
 			return fmt.Errorf("修复记录无法持久保存，未提交写入：%w", err)
+		}
+		current, err = m.assertDiskIdentity(job)
+		if err != nil {
+			return err
+		}
+		if reason := scanRepairBlockedReason(current); reason != "" {
+			return newJobError(reason, "SCAN_REPAIR_NOT_ALLOWED", 409)
+		}
+		physicalSectorSize = current.PhysicalSectorSize
+		if physicalSectorSize <= 0 {
+			physicalSectorSize = current.LogicalSectorSize
+		}
+		if current.LogicalSectorSize != job.Disk.LogicalSectorSize || physicalSectorSize != job.Disk.PhysicalSectorSize {
+			return errors.New("磁盘扇区格式已变化，停止慢扇区修复")
 		}
 		// A durable intent and original-data backup must precede the write.
 		written, writeErr := waitScanOperation(m, job, "写回", sample.Offset, sample.Bytes, func() (int, error) {
@@ -302,23 +339,53 @@ func (m *JobManager) repairSlowRequests(job *Job, cell *ScanCell, handle RepairH
 		final := pending
 		final.Outcome, final.WrittenBytes = "failed", int64(written)
 		if writeErr == nil {
+			afterLoad := m.newScanLoadMonitor(job.Device)
 			verify := scanBuffer(sample.Bytes)
 			began := time.Now()
 			n, readErr := m.readScanRequest(job, handle, verify, sample.Offset)
 			elapsed := float64(time.Since(began).Nanoseconds()) / 1e6
 			final.AfterMs = &elapsed
+			final.SpeedChecks = []float64{elapsed}
 			if readErr != nil {
 				writeErr = readErr
 			} else if n != len(verify) || !bytes.Equal(original, verify) {
 				writeErr = errors.New("写回后读回校验失败，原始数据备份已保留")
 			} else {
 				final.Outcome = "verified"
-				if elapsed > threshold {
-					final.Outcome = "still_slow"
+				// A second exact read separates content verification from a
+				// repeatable speed result. Never issue another write to this range.
+				began = time.Now()
+				n, readErr = m.readScanRequest(job, handle, verify, sample.Offset)
+				final.SpeedChecks = append(final.SpeedChecks, float64(time.Since(began).Nanoseconds())/1e6)
+				final.AfterMs = floatPtr(max(final.SpeedChecks[0], final.SpeedChecks[1]))
+				final.SpeedLoad = afterLoad.observe(int64(len(verify)+max(0, n)), true)
+				if readErr != nil {
+					writeErr = readErr
+				} else if n != len(verify) || !bytes.Equal(original, verify) {
+					writeErr = errors.New("修复后复测数据校验失败，原始数据备份已保留")
+				}
+				if writeErr == nil {
+					_, _, severe := scanReadThresholds(job.Disk.Rotational)
+					final.SpeedOutcome = repairSpeedOutcome(currentBefore, beforeMs, final.SpeedChecks, math.Min(threshold, severe), beforeActivity, final.SpeedLoad)
+					if final.SpeedOutcome == "still_slow" {
+						final.Outcome = "still_slow"
+					}
+					final.Detail = "写回校验通过；" + repairSpeedNote(&final, math.Min(threshold, severe))
+					proof := &ScanSlowBlock{Offset: sample.Offset, Bytes: sample.Bytes, FirstMs: final.SpeedChecks[0], RepeatMs: final.SpeedChecks[1], Source: "repair", Load: final.SpeedLoad}
+					m.mu.Lock()
+					temporary := *cell
+					temporary.SlowBadBlock = proof
+					if scanPersistentSlowBlock(temporary, job.Disk.Rotational) != nil {
+						cell.SlowBadBlock = proof
+						cell.Status = "severe"
+					}
+					m.mu.Unlock()
 				}
 			}
 		}
 		if writeErr != nil {
+			final.Outcome = "failed"
+			final.SpeedOutcome = "unconfirmed"
 			final.Detail = writeErr.Error()
 			if errors.Is(writeErr, errCancelled) || errors.Is(writeErr, errScanWaitTimeout) {
 				// Leave the durable intent pending: interruption cannot establish
@@ -330,7 +397,21 @@ func (m *JobManager) repairSlowRequests(job *Job, cell *ScanCell, handle RepairH
 		if err := m.recordRepairEvent(job, cell, sample, final); err != nil {
 			return err
 		}
+		if writeErr == nil && len(final.SpeedChecks) == 2 && final.SpeedLoad != nil && !final.SpeedLoad.BackgroundActivity {
+			region.postRepairReads = append(region.postRepairReads, ScanReadLatency{Offset: sample.Offset, Bytes: sample.Bytes, Ms: *final.AfterMs})
+			m.mu.Lock()
+			if proof := cell.SlowBadBlock; proof != nil && proof.Offset == sample.Offset && proof.Bytes == sample.Bytes {
+				_, _, severe := scanReadThresholds(job.Disk.Rotational)
+				if final.SpeedChecks[0] < severe && final.SpeedChecks[1] < severe {
+					cell.SlowBadBlock = nil
+				}
+			}
+			m.mu.Unlock()
+		}
 		if writeErr != nil {
+			m.mu.Lock()
+			cell.Status = "error"
+			m.mu.Unlock()
 			return writeErr
 		}
 	}

@@ -205,7 +205,7 @@ func TestScanIssueAPIProtectsRecordsAndChecksPagination(t *testing.T) {
 	status, body := doRequest(server, "GET", url, "", nil)
 	assertAPIError(t, status, body, 403, "ADMIN_REQUIRED")
 	headers := map[string]string{"X-Trim-Isadmin": "true"}
-	for _, query := range []string{"?limit=0", "?limit=201", "?offset=-1", "?offset=1", "?offset=0&offset=0", "?limit="} {
+	for _, query := range []string{"?limit=0", "?limit=201", "?offset=-1", "?offset=1", "?offset=0&offset=0", "?limit=", "?view=", "?view=invalid", "?view=ranges&view=ranges", "?view=ranges&offset=1"} {
 		status, body = doRequest(server, "GET", url+query, "", headers)
 		assertAPIError(t, status, body, 400, "INVALID_ARGUMENT")
 	}
@@ -213,7 +213,7 @@ func TestScanIssueAPIProtectsRecordsAndChecksPagination(t *testing.T) {
 	if status != 200 || body["issues"] == nil {
 		t.Fatalf("page unavailable: %d %v", status, body)
 	}
-	status, body = doRequest(server, "GET", "/api/jobs/"+job.ID+"/scan-report", "", headers)
+	status, body = doRequest(server, "GET", "/api/jobs/"+job.ID+"/scan-report?format=json", "", headers)
 	if status != 200 || body["recordsComplete"] != true {
 		t.Fatalf("invalid export: %d %v", status, body)
 	}

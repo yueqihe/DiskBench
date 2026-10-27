@@ -154,11 +154,14 @@ func TestScanLatencyAccountsForTransferSize(t *testing.T) {
 		{"normal HDD full read", 84, 8 * mib, "normal"},
 		{"same throughput quick read", 10.5, mib, "normal"},
 		{"slow full read boundary", 400, 8 * mib, "slow"},
-		{"severe full read boundary", 4000, 8 * mib, "severe"},
+		{"slow full read below red boundary", 7999, 8 * mib, "slow"},
+		{"severe full read boundary", 8000, 8 * mib, "severe"},
 		{"slow quick read", 50, mib, "slow"},
-		{"severe quick read", 500, mib, "severe"},
+		{"slow quick read below red boundary", 999.99, mib, "slow"},
+		{"severe quick read", 1000, mib, "severe"},
 		{"small tail command overhead", 10, 512, "normal"},
-		{"stalled small tail", 700, 512, "severe"},
+		{"slow small tail below red boundary", 700, 512, "slow"},
+		{"stalled small tail", 1000, 512, "severe"},
 		{"write plus read back", 84, 2 * 4 * mib, "normal"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -530,14 +533,16 @@ func TestReadOnlyExternalMountAllowsReadButRejectsWrites(t *testing.T) {
 	}
 	resolver := func(string) (*StorageSpace, error) { return space, nil }
 	readManager := newTestManager(t, JobManagerOptions{Mock: true, ResolveSpace: resolver})
-	if _, err := readManager.create("speed", space.Path, map[string]interface{}{
+	readJob, err := readManager.create("speed", space.Path, map[string]interface{}{
 		"speedTarget": "filesystem", "speedOperation": "read", "sampleMiB": float64(256),
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("read-only external read: %v", err)
 	}
+	waitForStatus(t, readManager, readJob.ID, "completed", 10*time.Second)
 
 	writeManager := newTestManager(t, JobManagerOptions{Mock: true, ResolveSpace: resolver})
-	_, err := writeManager.create("speed", space.Path, map[string]interface{}{
+	_, err = writeManager.create("speed", space.Path, map[string]interface{}{
 		"speedTarget": "filesystem", "speedOperation": "write", "sampleMiB": float64(256),
 	})
 	var jobErr *jobError

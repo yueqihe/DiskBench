@@ -15,6 +15,8 @@ func scanBuffer(size int) []byte {
 }
 
 type ScanRecheck struct {
+	requests       []ScanReadLatency
+	confirmedSlow  []ScanSlowBlock
 	Load           *ScanLoad `json:"load,omitempty"`
 	ioBytes        int64
 	MaxReadLatency *ScanReadLatency `json:"maxReadLatency,omitempty"`
@@ -45,7 +47,12 @@ func (m *JobManager) recheckSlowRead(handle ReadHandle, position int64, length i
 		if scanReadNeedsRecheck(read, job.Disk.Rotational) {
 			recheck.Outcome = "slow"
 		}
+		recheck.requests = append(recheck.requests, read.suspectReads...)
 		appendBadRanges(&ranges, read.badRanges, detailLimit)
+		if read.slowLimited {
+			recheck.Outcome = "slow"
+			return recheck, ranges, errScanSlowBudget
+		}
 		if err != nil {
 			recheck.Outcome = "read_issue"
 			return recheck, ranges, err
@@ -93,10 +100,30 @@ func (m *JobManager) recheckSlowRequests(handle ReadHandle, position int64, leng
 		combined = mergeScanRecheck(combined, r)
 		appendBadRanges(&ranges, issues, limit)
 		if err != nil {
+			confirmRepeatedSlowReads(combined, samples, job.Disk.Rotational)
 			return combined, ranges, err
 		}
 	}
+	confirmRepeatedSlowReads(combined, samples, job.Disk.Rotational)
 	return combined, ranges, nil
+}
+
+func confirmRepeatedSlowReads(recheck *ScanRecheck, first []ScanReadLatency, rotational bool) {
+	if recheck == nil {
+		return
+	}
+	_, _, threshold := scanReadThresholds(rotational)
+	for _, initial := range first {
+		if initial.Ms < threshold {
+			continue
+		}
+		for _, repeat := range recheck.requests {
+			if repeat.Offset == initial.Offset && repeat.Bytes == initial.Bytes && repeat.Ms >= threshold {
+				recheck.confirmedSlow = append(recheck.confirmedSlow, ScanSlowBlock{Offset: initial.Offset, Bytes: initial.Bytes, FirstMs: initial.Ms, RepeatMs: repeat.Ms, Source: "recheck"})
+				break
+			}
+		}
+	}
 }
 
 // Replace rather than mutate: API snapshots may share the previous pointer.
@@ -105,6 +132,8 @@ func mergeScanRecheck(previous, next *ScanRecheck) *ScanRecheck {
 		return next
 	}
 	combined := *next
+	combined.requests = append(append([]ScanReadLatency(nil), previous.requests...), next.requests...)
+	combined.confirmedSlow = append(append([]ScanSlowBlock(nil), previous.confirmedSlow...), next.confirmedSlow...)
 	combined.Reads += previous.Reads
 	combined.BytesRead += previous.BytesRead
 	combined.ErrorCount += previous.ErrorCount

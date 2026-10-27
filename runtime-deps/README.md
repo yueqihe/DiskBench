@@ -16,3 +16,22 @@ package being installed globally on fnOS. Core system tools (`lsblk`,
 
 The binaries are extracted from Alpine Linux 3.22 runtime packages.
 See `THIRD_PARTY.md` for package versions, licenses, and source locations.
+`sources.json` pins exact Alpine commits, source checksums and binary origins.
+The current source catalog covers both CPU architectures; identical package
+versions share source archives and build recipes.
+
+License texts in `licenses/`, `THIRD_PARTY.md` and `sources.json` are copied into
+every FPK by `scripts/stage.js`. Keep these in sync with tool/library updates.
+
+To prepare the companion source archive before publishing (Python 3.10+):
+
+```bash
+python scripts/prepare-third-party-sources.py
+```
+
+This downloads the exact upstream source archives, Alpine patches and recipes,
+checks their pinned hashes, and writes
+`dist/diskbench-third-party-sources-<version>.tar.gz`. Downloads are cached in
+`.tools/third-party-sources/`; no recipe is executed. Provide this archive next
+to the FPK downloads with the same download access, rather than relying on a
+private project repository or promising an unavailable source download.

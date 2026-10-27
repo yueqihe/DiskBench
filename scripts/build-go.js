@@ -13,6 +13,6 @@ env.GOOS = goos;
 env.GOARCH = goarch;
 env.CGO_ENABLED = "0";
 
-const status = runGo(["build", "-o", outPath, "."], { env });
+const status = runGo(["build", "-trimpath", "-buildvcs=false", "-ldflags=-s -w", "-o", outPath, "."], { env });
 if (status !== 0) process.exit(status);
 console.log(`Built ${path.relative(backendDir, outPath)} (${goos}/${goarch})`);

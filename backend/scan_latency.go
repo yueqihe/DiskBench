@@ -47,9 +47,9 @@ func applyHDDLatency(cell *ScanCell, warning string, ratio float64) {
 	if cell.ErrorCount > 0 {
 		return
 	}
-	if cell.LatencyWarning == "relative-severe" {
-		cell.Status = "severe"
-	} else if cell.LatencyWarning != "" && cell.Status == "normal" {
+	// Relative speed remains a warning; absolute media thresholds determine
+	// the poor and severe bands, so a fast baseline cannot lower those limits.
+	if cell.LatencyWarning != "" && cell.Status == "normal" {
 		cell.Status = "slow"
 	}
 }

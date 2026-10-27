@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -96,7 +97,7 @@ func TestSlowRepairBacksUpOriginalBeforeWritingOnlyTheSlowRequest(t *testing.T) 
 		}
 	}
 	r := job.Result.(*ScanResult)
-	if err := m.repairSlowRequests(job, &r.Map[0], h, source, 0, region); err != nil {
+	if err := m.repairSlowRequests(job, &r.Map[0], h, source, 0, &region); err != nil {
 		t.Fatal(err)
 	}
 	if h.writes.Load() != 1 || h.writeOffset != 512 || h.writeLength != 512 || !bytes.Equal(h.data, source) {
@@ -142,7 +143,7 @@ func TestRepairNeverWritesBelowThresholdOrIncompleteOrChangedData(t *testing.T) 
 				h.data[512] ^= 1
 			}
 			r := job.Result.(*ScanResult)
-			if err := m.repairSlowRequests(job, &r.Map[0], h, source, 0, region); err != nil {
+			if err := m.repairSlowRequests(job, &r.Map[0], h, source, 0, &region); err != nil {
 				t.Fatal(err)
 			}
 			if h.writes.Load() != 0 {
@@ -167,7 +168,7 @@ func TestRepairBackupOrIntentFailurePreventsWrite(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		if err := m.repairSlowRequests(job, &job.Result.(*ScanResult).Map[0], h, source, 0, region); err == nil {
+		if err := m.repairSlowRequests(job, &job.Result.(*ScanResult).Map[0], h, source, 0, &region); err == nil {
 			t.Fatal("ignored persistence failure")
 		}
 		if h.writes.Load() != 0 {
@@ -214,7 +215,7 @@ func TestRepairStopsOnShortWriteFlushOrReadbackFailure(t *testing.T) {
 			}
 			region.slowReads = append(region.slowReads, ScanReadLatency{Ms: 502, Bytes: 512, Offset: 1024})
 			r := job.Result.(*ScanResult)
-			if err := m.repairSlowRequests(job, &r.Map[0], h, source, 0, region); err == nil {
+			if err := m.repairSlowRequests(job, &r.Map[0], h, source, 0, &region); err == nil {
 				t.Fatal("ignored repair failure")
 			}
 			if h.writes.Load() != 1 || r.Stats.Repair.Failed != 1 || r.Stats.Repair.Verified != 0 || r.Stats.Repair.Pending != 0 {
@@ -227,9 +228,10 @@ func TestRepairStopsOnShortWriteFlushOrReadbackFailure(t *testing.T) {
 func TestRepairSeparatesVerifiedDataFromStillSlowResponse(t *testing.T) {
 	m, job, h, source, region := repairFixture(t)
 	job.Options.ScanRepairAfterMs = intPtr(1)
+	m.scanActivityFn = func(string) (ScanActivity, error) { return ScanActivity{}, nil }
 	h.slowVerify = true
 	r := job.Result.(*ScanResult)
-	if err := m.repairSlowRequests(job, &r.Map[0], h, source, 0, region); err != nil {
+	if err := m.repairSlowRequests(job, &r.Map[0], h, source, 0, &region); err != nil {
 		t.Fatal(err)
 	}
 	if r.Stats.Repair.StillSlow != 1 || r.Stats.Repair.Verified != 0 {
@@ -248,7 +250,7 @@ func TestRepairNormalizesUnknownPhysicalSectorSizeAndRejectsChangedFormat(t *tes
 			disk.PhysicalSectorSize = 4096
 		}
 		m.resolveDisk = func(string) (*Disk, error) { return disk, nil }
-		err := m.repairSlowRequests(job, &job.Result.(*ScanResult).Map[0], h, source, 0, region)
+		err := m.repairSlowRequests(job, &job.Result.(*ScanResult).Map[0], h, source, 0, &region)
 		if changed {
 			if err == nil || h.writes.Load() != 0 {
 				t.Fatal("changed sector format permitted a write")
@@ -269,7 +271,7 @@ func TestRepairCancellationAndTimeoutKeepPendingWriteOccupied(t *testing.T) {
 			cancel := m.beginCancellation(job)
 			h.writeStarted, h.releaseWrite = make(chan struct{}), make(chan struct{})
 			finished := make(chan error, 1)
-			go func() { finished <- m.repairSlowRequests(job, &job.Result.(*ScanResult).Map[0], h, source, 0, region) }()
+			go func() { finished <- m.repairSlowRequests(job, &job.Result.(*ScanResult).Map[0], h, source, 0, &region) }()
 			select {
 			case <-h.writeStarted:
 			case <-time.After(time.Second):
@@ -349,8 +351,56 @@ func TestScanRepairRejectsUnsafeTargetsAndUnacknowledgedRequests(t *testing.T) {
 	}
 }
 
-func TestScanIntegratesThresholdRepairAndKeepsFirstSlowResult(t *testing.T) {
+func TestScanRepairAllowsResidualZFSLabelsAndUnknownFilesystems(t *testing.T) {
+	for _, fileSystems := range [][]string{nil, {"unknown"}, {"ext4"}, {"zfs_member"}, {"ZFS_MEMBER", "ext4"}} {
+		disk := testDisk()
+		disk.FileSystems = fileSystems
+		if reason := scanRepairBlockedReason(disk); reason != "" {
+			t.Fatalf("unused disk with %v was blocked: %s", fileSystems, reason)
+		}
+		for _, other := range []string{"linux_raid_member", "LVM2_member", "crypto_LUKS", "bcache", "swap"} {
+			blocked := *disk
+			blocked.FileSystems = append(append([]string(nil), fileSystems...), other)
+			if scanRepairBlockedReason(&blocked) == "" {
+				t.Fatalf("ZFS exception bypassed %s restriction", other)
+			}
+		}
+	}
+}
+
+func TestScanRepairZFSDeviceMustBeExclusiveBeforeAnyReadsOrWrites(t *testing.T) {
 	disk := testDisk()
+	disk.FileSystems = []string{"zfs_member"}
+	var repairOpens, readOpens atomic.Int64
+	busy := errors.New("device or resource busy")
+	m := newTestManager(t, JobManagerOptions{
+		ResolveDisk: func(string) (*Disk, error) { return disk, nil },
+		OpenRepair: func(string) (RepairHandle, error) {
+			repairOpens.Add(1)
+			return nil, busy
+		},
+		Open: func(string) (ReadHandle, error) {
+			readOpens.Add(1)
+			return nil, errors.New("scan must not start")
+		},
+	})
+	job, err := m.create("scan", disk.Path, map[string]interface{}{
+		"scanMode": "full", "scanRepair": true, "scanRepairAcknowledged": true,
+		"expectedDisk": map[string]interface{}{"path": disk.Path, "serial": disk.Serial, "model": disk.Model, "size": disk.Size},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := waitForStatus(t, m, job.ID, "failed", time.Second)
+	r := done.Result.(*ScanResult)
+	if repairOpens.Load() != 1 || readOpens.Load() != 0 || r.Stats.BytesRead != 0 || r.Stats.Repair.WrittenBytes != 0 || !strings.Contains(done.Message, busy.Error()) {
+		t.Fatalf("busy ZFS device was used: opens %d/%d, stats %+v, message %s", repairOpens.Load(), readOpens.Load(), r.Stats, done.Message)
+	}
+}
+
+func TestScanIntegratesThresholdRepairAndKeepsFirstSlowEvidence(t *testing.T) {
+	disk := testDisk()
+	disk.FileSystems = []string{"zfs_member"}
 	disk.Size = 4096 * 4096
 	h := &memoryRepairHandle{data: bytes.Repeat([]byte{0x3b}, int(disk.Size))}
 	var delayed atomic.Bool
@@ -368,6 +418,7 @@ func TestScanIntegratesThresholdRepairAndKeepsFirstSlowResult(t *testing.T) {
 		},
 		OpenRepair:   func(string) (RepairHandle, error) { repairOpens.Add(1); return h, nil },
 		ScanEvidence: func(Disk) ScanEvidence { return ScanEvidence{} },
+		ScanActivity: func(string) (ScanActivity, error) { return ScanActivity{}, nil },
 	})
 	job, err := m.create("scan", disk.Path, map[string]interface{}{"scanMode": "full", "scanRepair": true, "scanRepairAfterMs": 25, "scanRepairAcknowledged": true, "expectedDisk": map[string]interface{}{"path": disk.Path, "serial": disk.Serial, "model": disk.Model, "size": disk.Size}})
 	if err != nil {
@@ -375,10 +426,20 @@ func TestScanIntegratesThresholdRepairAndKeepsFirstSlowResult(t *testing.T) {
 	}
 	done := waitForStatus(t, m, job.ID, "completed", 5*time.Second)
 	r := done.Result.(*ScanResult)
-	if repairOpens.Load() != 1 || h.writes.Load() < 1 || r.Stats.Repair.Verified < 1 || r.Map[0].MaxReadLatency.Ms < 25 || r.Stats.CoveredBytes != disk.Size || r.Stats.UnreadableRanges != 0 {
-		t.Fatalf("repair not integrated or first warning lost: %+v", r.Stats)
+	if repairOpens.Load() != 1 || h.writes.Load() < 1 || r.Stats.Repair.Verified < 1 || r.Map[0].MaxReadLatency.Ms >= 25 || r.Stats.CoveredBytes != disk.Size || r.Stats.UnreadableRanges != 0 {
+		t.Fatalf("repair not integrated or verified timing not refreshed: %+v", r.Stats)
 	}
 	if r.Map[0].Repair == nil || r.Map[0].Repair.Verified != 1 {
 		t.Fatalf("cell repair missing: %+v", r.Map[0])
 	}
+	page, err := m.scanIssues(job.ID, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, issue := range page.Records {
+		if issue.Repair != nil && issue.Repair.BeforeMs >= 25 {
+			return // First slow evidence remains in the journal, not the new map color.
+		}
+	}
+	t.Fatal("repair journal lost the first slow response")
 }

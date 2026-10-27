@@ -11,7 +11,7 @@ import (
 func openRepairDevice(path string) (RepairHandle, error) {
 	h, err := os.OpenFile(path, os.O_RDWR|syscall.O_DIRECT|syscall.O_EXCL, 0)
 	if err != nil {
-		return nil, fmt.Errorf("无法独占开启慢扇区修复，请卸载磁盘并停止其他磁盘工具：%w", err)
+		return nil, fmt.Errorf("无法独占开启慢扇区修复，请先解除磁盘占用：卸载分区、导出正在使用的 ZFS 池或停止其他磁盘工具：%w", err)
 	}
 	info, err := h.Stat()
 	if err != nil || info.Mode()&os.ModeDevice == 0 || info.Mode()&os.ModeCharDevice != 0 {

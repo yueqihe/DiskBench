@@ -76,7 +76,8 @@ func (l *scanLoadMonitor) observe(ownBytes int64, force bool) *ScanLoad {
 	load := &ScanLoad{OtherReadBytes: max(0, int64(current.ReadBytes-previous.ReadBytes)-own),
 		WriteBytes: int64(current.WriteBytes - previous.WriteBytes), InFlight: current.InFlight}
 	// This is evidence of concurrent work, not proof of what caused a stall.
-	// Passthrough I/O may bypass these counters, so read activity is conservative.
+	// Direct block reads enter these counters; driver retries and failed I/O
+	// can still make the byte attribution approximate.
 	load.BackgroundActivity = load.OtherReadBytes >= 1024*1024 || load.WriteBytes >= 64*1024 || load.InFlight > 0
 	return load
 }

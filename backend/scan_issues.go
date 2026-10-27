@@ -14,7 +14,13 @@ import (
 const scanIssuePreviewLimit = 200
 
 func validScanJournalRecord(r BadRange, size int64) bool {
-	if r.Offset < 0 || r.Length <= 0 || r.Offset > size-r.Length || r.ProbeBytes < 0 || r.Code == "" || r.UnresolvedBytes < 0 || r.UnresolvedBytes > r.Length || (r.UnresolvedBytes > 0 && (r.Code != "LOCALIZATION_LIMIT" || r.Outcome != "unresolved")) {
+	if r.SkippedRange != nil {
+		return false // Combined display rows must never replace original events.
+	}
+	if r.Offset < 0 || r.Length <= 0 || r.Offset > size-r.Length || r.ProbeBytes < 0 || r.Code == "" || r.UnresolvedBytes < 0 || r.UnresolvedBytes > r.Length || (r.UnresolvedBytes > 0 && ((r.Code != "LOCALIZATION_LIMIT" && r.Code != "SLOW_READ_LIMIT") || r.Outcome != "unresolved")) {
+		return false
+	}
+	if r.Code == "SLOW_READ_LIMIT" && (r.Outcome != "unresolved" || r.UnresolvedBytes != r.Length || r.Detail == "") {
 		return false
 	}
 	switch r.Outcome {
@@ -76,6 +82,11 @@ func deviceScanIssue(r BadRange) bool {
 }
 
 func countScanIssue(stats *ScanStats, cell *ScanCell, r BadRange) {
+	if stats.lastIssue != nil && timeoutSkipPair(*stats.lastIssue, r) {
+		stats.TimeoutSkipPairs++
+	}
+	previous := r
+	stats.lastIssue = &previous
 	stats.IssueCount++
 	switch r.Outcome {
 	case "rewrite":
@@ -113,10 +124,16 @@ func countScanIssue(stats *ScanStats, cell *ScanCell, r BadRange) {
 		}
 	default:
 		stats.UnresolvedRanges++
-		if r.Code == "LOCALIZATION_LIMIT" {
+		if r.Code == "LOCALIZATION_LIMIT" || r.Code == "SLOW_READ_LIMIT" {
 			stats.UnresolvedBytes += r.UnresolvedBytes
 			if cell != nil {
 				cell.UnresolvedBytes += r.UnresolvedBytes
+			}
+		}
+		if r.Code == "SLOW_READ_LIMIT" {
+			stats.SkippedBytes += r.UnresolvedBytes
+			if cell != nil {
+				cell.SkippedBytes += r.UnresolvedBytes
 			}
 		}
 		if cell != nil && (cell.ReadOutcome == "" || cell.ReadOutcome == "readable") {
@@ -181,7 +198,27 @@ func (m *JobManager) recordScanIssuesLocked(job *Job, cell *ScanCell, ranges []B
 	return nil
 }
 
-func scanOutcomeCompletionMessage(label string, result *ScanResult, errorCells, slowCells int64) string {
+func scanOutcomeCompletionMessage(label string, result *ScanResult, errorCells, slowCells int64, media ...bool) string {
+	rotational := !strings.HasPrefix(result.LatencyBasis, "solid-")
+	if len(media) > 0 {
+		rotational = media[0]
+	}
+	bad := scanBadBlocks(result, rotational)
+	if bad.Total > 0 {
+		return fmt.Sprintf("%s发现 %d 个坏块区域（慢速 %d、不可读 %d），已不满足正常使用要求，建议更换硬盘", label, bad.Total, bad.Slow, bad.Unreadable)
+	}
+	if result.Stats.SkippedBytes > 0 {
+		return fmt.Sprintf("%s发现 %d 个异常区域，严重卡读已影响正常使用；跳过 %s 未读范围并继续后续区域", label, scanAbnormalCellCount(result), reportBytes(result.Stats.SkippedBytes))
+	}
+	severe := int64(0)
+	for _, cell := range result.Map {
+		if severeScanStatus(cell.Status) {
+			severe++
+		}
+	}
+	if severe > 0 {
+		return fmt.Sprintf("%s发现 %d 个异常区域，存在严重慢读，已影响正常使用", label, scanAbnormalCellCount(result))
+	}
 	if result.Version < 2 || result.Stats.IssueCount == 0 {
 		return scanCompletionMessage(label, errorCells, slowCells)
 	}
@@ -295,6 +332,128 @@ func (m *JobManager) scanIssues(id string, offset int64, limit int) (*ScanIssueP
 	return page, nil
 }
 
+func completesRepairAttempt(pending, final BadRange) bool {
+	if pending.Outcome != "rewrite" || pending.Repair == nil || pending.Repair.Outcome != "pending" ||
+		final.Outcome != "rewrite" || final.Repair == nil || pending.Repair.BackupFile == "" ||
+		pending.Offset != final.Offset || pending.Length != final.Length ||
+		pending.Repair.BackupFile != final.Repair.BackupFile || pending.Repair.BeforeMs != final.Repair.BeforeMs {
+		return false
+	}
+	switch final.Repair.Outcome {
+	case "verified", "still_slow", "failed", "uncertain":
+		return true
+	}
+	return false
+}
+
+type scanIssueRows struct {
+	pending *BadRange
+	emit    func(BadRange) error
+}
+
+// A timeout and its immediately following skipped suffix describe one event.
+// Keep the full failed request and the exact unread suffix as distinct ranges.
+func timeoutSkipPair(failed, skipped BadRange) bool {
+	return failed.Code == "TIMEOUT" && failed.Outcome == "device_error" &&
+		(failed.Recovered == nil || !*failed.Recovered) && failed.SkippedRange == nil &&
+		skipped.Code == "SLOW_READ_LIMIT" && skipped.Outcome == "unresolved" &&
+		skipped.Length > 0 && skipped.UnresolvedBytes == skipped.Length &&
+		failed.Length > 0 && skipped.Offset >= failed.Offset &&
+		skipped.Offset+skipped.Length == failed.Offset+failed.Length
+}
+
+func (rows *scanIssueRows) add(r BadRange) error {
+	if rows.pending != nil {
+		if timeoutSkipPair(*rows.pending, r) {
+			merged := *rows.pending
+			merged.SkippedRange = &ScanSkippedRange{Offset: r.Offset, Length: r.Length}
+			rows.pending = nil
+			return rows.emit(merged)
+		}
+		if completesRepairAttempt(*rows.pending, r) {
+			rows.pending = nil
+			return rows.emit(r)
+		}
+		if err := rows.flush(); err != nil {
+			return err
+		}
+	}
+	if r.Outcome == "rewrite" && r.Repair != nil && r.Repair.Outcome == "pending" || r.Code == "TIMEOUT" && r.Outcome == "device_error" {
+		rows.pending = &r
+		return nil
+	}
+	return rows.emit(r)
+}
+
+func (rows *scanIssueRows) flush() error {
+	if rows.pending == nil {
+		return nil
+	}
+	r := *rows.pending
+	rows.pending = nil
+	return rows.emit(r)
+}
+
+// Paginate merged display rows, keeping the append-only audit journal intact.
+// Adjacent repair events and timeout/skip pairs share one row.
+func (m *JobManager) scanIssueRanges(id string, offset int64, limit int) (*ScanIssuePage, error) {
+	if offset < 0 || limit < 1 || limit > 200 {
+		return nil, newJobError("异常明细分页参数无效", "INVALID_ARGUMENT", 400)
+	}
+	job, f, size, err := m.scanIssueSnapshot(id)
+	if err != nil {
+		return nil, err
+	}
+	s := job.Result.(*ScanResult)
+	page := &ScanIssuePage{Offset: offset, Next: offset, Records: []BadRange{}, Legacy: s.Version < 2, Complete: s.Version >= 2 && s.Stats.IssuesComplete}
+	rows := scanIssueRows{emit: func(r BadRange) error {
+		if page.Total >= offset && len(page.Records) < limit {
+			page.Records = append(page.Records, r)
+			page.Next++
+		}
+		page.Total++
+		return nil
+	}}
+	if f != nil {
+		defer f.Close()
+		// Stream the snapshot to count logical rows without retaining the journal.
+		scanner := issueScanner(io.LimitReader(f, size))
+		for index := int64(0); index < s.Stats.SavedIssueCount; index++ {
+			if !scanner.Scan() {
+				if err := scanner.Err(); err != nil {
+					return nil, err
+				}
+				return nil, errors.New("异常记录被截断，报告不完整")
+			}
+			var r BadRange
+			if err := json.Unmarshal(scanner.Bytes(), &r); err != nil || !validScanJournalRecord(r, job.Disk.Size) {
+				return nil, errors.New("异常记录损坏，无法完整读取")
+			}
+			if err := rows.add(r); err != nil {
+				return nil, err
+			}
+		}
+	} else if page.Legacy {
+		for _, r := range s.Stats.BadRanges {
+			if err := rows.add(r); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if err := rows.flush(); err != nil {
+		return nil, err
+	}
+	for _, r := range scanSevereRanges(s, job.Disk.Rotational) {
+		if err := rows.emit(r); err != nil {
+			return nil, err
+		}
+	}
+	if offset > page.Total {
+		return nil, newJobError("offset 超出异常记录范围", "INVALID_ARGUMENT", 400)
+	}
+	return page, nil
+}
+
 func (m *JobManager) removeScanIssueFile(id string) {
 	if !jobIDPattern.MatchString(id) {
 		return
@@ -321,9 +480,10 @@ func (m *JobManager) restoreScanIssues(job *Job) {
 	}
 	defer f.Close()
 	stats := r.Stats
+	stats.TimeoutSkipPairs, stats.lastIssue = 0, nil
 	stats.IssueCount, stats.SavedIssueCount, stats.UnreadableRanges, stats.UnreadableBytes = 0, 0, 0, 0
 	stats.RecoveredRanges, stats.DeviceErrorRanges, stats.UnresolvedRanges = 0, 0, 0
-	stats.UnresolvedBytes = 0
+	stats.UnresolvedBytes, stats.SkippedBytes = 0, 0
 	stats.BadRanges = []BadRange{}
 	stats.Repair = ScanRepairStats{}
 	scanner := issueScanner(f)
@@ -356,9 +516,11 @@ func (m *JobManager) restoreScanIssues(job *Job) {
 			stats.IssueWarning = "部分已发现的异常缺少完整地址，报告不完整"
 		}
 		stats.IssueCount = r.Stats.IssueCount
+		stats.TimeoutSkipPairs = r.Stats.TimeoutSkipPairs
 		stats.UnreadableRanges, stats.UnreadableBytes = r.Stats.UnreadableRanges, r.Stats.UnreadableBytes
 		stats.RecoveredRanges, stats.DeviceErrorRanges, stats.UnresolvedRanges = r.Stats.RecoveredRanges, r.Stats.DeviceErrorRanges, r.Stats.UnresolvedRanges
 		stats.UnresolvedBytes = r.Stats.UnresolvedBytes
+		stats.SkippedBytes = r.Stats.SkippedBytes
 		stats.Repair = r.Stats.Repair
 		if len(r.Stats.BadRanges) > len(stats.BadRanges) {
 			stats.BadRanges = r.Stats.BadRanges

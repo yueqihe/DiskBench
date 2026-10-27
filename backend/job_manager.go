@@ -155,6 +155,7 @@ type StorageSpaceSnapshot struct {
 }
 
 type JobOptions struct {
+	ScanRepairFrom    string  `json:"scanRepairFrom,omitempty"`
 	ScanDeepLocate    *bool   `json:"scanDeepLocate,omitempty"`
 	ScanMode          *string `json:"scanMode,omitempty"`
 	ScanExactSectors  *bool   `json:"scanExactSectors,omitempty"`
@@ -178,6 +179,8 @@ type JobOptions struct {
 }
 
 type BadRange struct {
+	SkippedRange    *ScanSkippedRange `json:"skippedRange,omitempty"` // Display only; journal events remain separate.
+	Detail          string            `json:"detail,omitempty"`
 	UnresolvedBytes int64             `json:"unresolvedBytes,omitempty"`
 	Repair          *ScanRepairRecord `json:"repair,omitempty"`
 	Outcome         string            `json:"outcome,omitempty"`
@@ -189,7 +192,14 @@ type BadRange struct {
 	Evidence        *ScanIOEvidence   `json:"evidence,omitempty"`
 }
 
+type ScanSkippedRange struct {
+	Offset int64 `json:"offset"`
+	Length int64 `json:"length"`
+}
+
 type ScanCell struct {
+	SlowBadBlock      *ScanSlowBlock    `json:"slowBadBlock,omitempty"`
+	SkippedBytes      int64             `json:"skippedBytes,omitempty"`
 	SampleRanges      []ScanSampleRange `json:"sampleRanges,omitempty"`
 	UnresolvedBytes   int64             `json:"unresolvedBytes,omitempty"`
 	Load              *ScanLoad         `json:"load,omitempty"`
@@ -220,6 +230,9 @@ type ScanCell struct {
 }
 
 type ScanStats struct {
+	TimeoutSkipPairs  int64 `json:"timeoutSkipPairs,omitempty"`
+	lastIssue         *BadRange
+	SkippedBytes      int64           `json:"skippedBytes,omitempty"`
 	UnresolvedBytes   int64           `json:"unresolvedBytes,omitempty"`
 	Repair            ScanRepairStats `json:"repair"`
 	CoveredBytes      int64           `json:"coveredBytes,omitempty"`
@@ -241,16 +254,17 @@ type ScanStats struct {
 }
 
 type ScanResult struct {
-	SamplingPlan string           `json:"samplingPlan,omitempty"`
-	SamplingSeed uint32           `json:"samplingSeed,omitempty"`
-	Version      int              `json:"version,omitempty"`
-	Diagnostics  *ScanDiagnostics `json:"diagnostics,omitempty"`
-	LatencyBasis string           `json:"latencyBasis,omitempty"`
-	ScanMode     string           `json:"scanMode"`
-	Coverage     string           `json:"coverage"`
-	SampleBytes  *int64           `json:"sampleBytes"`
-	Map          []ScanCell       `json:"map"`
-	Stats        ScanStats        `json:"stats"`
+	RepairTargets []RecordedRepairTarget `json:"repairTargets,omitempty"`
+	SamplingPlan  string                 `json:"samplingPlan,omitempty"`
+	SamplingSeed  uint32                 `json:"samplingSeed,omitempty"`
+	Version       int                    `json:"version,omitempty"`
+	Diagnostics   *ScanDiagnostics       `json:"diagnostics,omitempty"`
+	LatencyBasis  string                 `json:"latencyBasis,omitempty"`
+	ScanMode      string                 `json:"scanMode"`
+	Coverage      string                 `json:"coverage"`
+	SampleBytes   *int64                 `json:"sampleBytes"`
+	Map           []ScanCell             `json:"map"`
+	Stats         ScanStats              `json:"stats"`
 }
 
 type ScanProgressSnapshot struct {
@@ -425,7 +439,7 @@ func classifyLatency(milliseconds float64, errorCount int64) string {
 	if milliseconds < 50 {
 		return "normal"
 	}
-	if milliseconds < 500 {
+	if milliseconds < scanLegacyTransferSevereMS {
 		return "slow"
 	}
 	return "severe"
@@ -671,6 +685,7 @@ func cloneJobLocked(job *Job) *Job {
 	switch result := job.Result.(type) {
 	case *ScanResult:
 		copyResult := *result
+		copyResult.RepairTargets = append([]RecordedRepairTarget(nil), result.RepairTargets...)
 		copyResult.Map = append([]ScanCell{}, result.Map...)
 		copyResult.Stats.BadRanges = append([]BadRange{}, result.Stats.BadRanges...)
 		cloned.Result = &copyResult
@@ -797,7 +812,7 @@ func NewJobManager(dataDir string, options JobManagerOptions) *JobManager {
 		m.nowFn = time.Now
 	}
 	if m.scanReadTimeout <= 0 {
-		m.scanReadTimeout = 90 * time.Second
+		m.scanReadTimeout = 10 * time.Second
 	}
 	if m.scanProbeTimeout <= 0 {
 		m.scanProbeTimeout = 15 * time.Second
@@ -862,6 +877,9 @@ func (m *JobManager) loadJobs() {
 			switch job.Type {
 			case "scan":
 				job.Phase = "扫描完成"
+				if job.Options.ScanRepairFrom != "" {
+					job.Phase = "慢区修复完成"
+				}
 			case "speed":
 				job.Phase = "测速完成"
 			case "write":
@@ -1211,6 +1229,9 @@ func (m *JobManager) complete(job *Job, result interface{}, message string) {
 	switch job.Type {
 	case "scan":
 		job.Phase = "扫描完成"
+		if job.Options.ScanRepairFrom != "" {
+			job.Phase = "慢区修复完成"
+		}
 	case "speed":
 		job.Phase = "测速完成"
 	case "write":
@@ -1386,6 +1407,21 @@ func (m *JobManager) readWithRetries(handle ReadHandle, buffer []byte, length in
 			if m.checkCancelled(job) != nil {
 				return readWithRetriesResult{}, errCancelled
 			}
+			if errors.Is(err, errScanSlowBudget) {
+				return readWithRetriesResult{bytesRead: bytesRead + result.bytesRead, shortRead: shortRead}, err
+			}
+			if errors.Is(err, errScanWaitTimeout) {
+				if waitErr := m.waitPendingScanRead(job); waitErr != nil {
+					return readWithRetriesResult{}, waitErr
+				}
+				// The original request has settled; this timeout may now skip
+				// the region without overlapping the next kernel read.
+				if evidence := scanProtocolError(err); evidence != nil {
+					err = evidence
+				} else {
+					return readWithRetriesResult{}, err
+				}
+			}
 			err = classifyScanSystemError(err)
 			var cerr error
 			if err == errCancelled {
@@ -1472,15 +1508,33 @@ func (m *JobManager) locateReadErrors(handle ReadHandle, start, length int64, jo
 	var badRanges []BadRange
 	bytesRead := 0
 	var lastEvidence *ScanIOEvidence
+	slowLimited := false
 	var probe func(int64, int64) error
 	probe = func(position, size int64) error {
+		if slowLimited {
+			appendSlowSkippedRange(&badRanges, position, size, limit)
+			return nil
+		}
 		result, err := m.readWithRetries(handle, buffer, int(size), position, job)
+		if errors.Is(err, errScanSlowBudget) {
+			bytesRead += result.bytesRead
+			appendSlowSkippedRange(&badRanges, position+int64(result.bytesRead), size-int64(result.bytesRead), limit)
+			return nil
+		}
 		if errors.Is(err, errScanProbeBudget) {
 			appendUnresolvedProbeRange(&badRanges, position, size, lastEvidence, limit)
 			return nil
 		}
 		if err != nil {
 			return err
+		}
+		if e := scanProtocolError(result.err); e != nil && e.Evidence.Kind == "TIMEOUT" {
+			prefix := scanTimeoutPrefix(result, position)
+			bytesRead += prefix
+			appendBadRanges(&badRanges, []BadRange{scanIssueRange(position, size, result.err, boolPtr(false))}, limit)
+			appendSlowSkippedRange(&badRanges, position+int64(prefix), size-int64(prefix), limit)
+			slowLimited = true
+			return nil
 		}
 		issue := result.err != nil || result.shortRead != nil || result.bytesRead != int(size)
 		if e := scanProtocolError(result.err); e != nil {
@@ -1516,7 +1570,7 @@ func (m *JobManager) locateReadErrors(handle ReadHandle, start, length int64, jo
 			if bytesRead-before == int(size) && len(badRanges) == detailBefore {
 				recovered := true
 				r := scanIssueRange(position, size, result.err, &recovered)
-				if scanProtocolError(result.err) == nil {
+				if r.Code == "EIO" && scanProtocolError(result.err) == nil {
 					r.Code = "READ_RETRY"
 				}
 				appendBadRanges(&badRanges, []BadRange{r}, limit)
@@ -1527,17 +1581,30 @@ func (m *JobManager) locateReadErrors(handle ReadHandle, start, length int64, jo
 		// still unreadable now. Never erase the first failure.
 		if e := scanProtocolError(result.err); e != nil && e.Evidence.DoNotRetry {
 			r := scanIssueRange(position, size, result.err, boolPtr(false))
-			r.Outcome, r.ProbeBytes = "unreadable", probeSize
+			r.Outcome, r.ProbeBytes = "unreadable", min(probeSize, size)
 			appendBadRanges(&badRanges, []BadRange{r}, limit)
 			return nil
 		}
 		retry, err := m.readWithRetries(handle, buffer, int(size), position, job)
+		if errors.Is(err, errScanSlowBudget) {
+			bytesRead += retry.bytesRead
+			appendSlowSkippedRange(&badRanges, position+int64(retry.bytesRead), size-int64(retry.bytesRead), limit)
+			return nil
+		}
 		if errors.Is(err, errScanProbeBudget) {
 			appendUnresolvedProbeRange(&badRanges, position, size, lastEvidence, limit)
 			return nil
 		}
 		if err != nil {
 			return err
+		}
+		if e := scanProtocolError(retry.err); e != nil && e.Evidence.Kind == "TIMEOUT" {
+			prefix := scanTimeoutPrefix(retry, position)
+			bytesRead += prefix
+			appendBadRanges(&badRanges, []BadRange{scanIssueRange(position, size, retry.err, boolPtr(false))}, limit)
+			appendSlowSkippedRange(&badRanges, position+int64(prefix), size-int64(prefix), limit)
+			slowLimited = true
+			return nil
 		}
 		if e := scanProtocolError(retry.err); e != nil && !localizableScanIssue(e) && e.Evidence.Kind != "RECOVERED_ERROR" {
 			appendBadRanges(&badRanges, []BadRange{scanIssueRange(position, size, retry.err, boolPtr(false))}, limit)
@@ -1553,7 +1620,7 @@ func (m *JobManager) locateReadErrors(handle ReadHandle, start, length int64, jo
 			code = "EIO"
 		}
 		r := scanIssueRange(position, size, result.err, &recovered)
-		r.ProbeBytes = probeSize
+		r.ProbeBytes = min(probeSize, size)
 		if !recovered {
 			r.Outcome = "unreadable"
 		}
@@ -1574,14 +1641,16 @@ func (m *JobManager) locateReadErrors(handle ReadHandle, start, length int64, jo
 }
 
 type readRegionResult struct {
-	suspectReads   []ScanReadLatency
-	ioBytes        int64
-	slowReads      []ScanReadLatency
-	maxReadLatency *ScanReadLatency
-	bytesRead      int
-	milliseconds   float64
-	badRanges      []BadRange
-	errorCount     int
+	postRepairReads []ScanReadLatency
+	slowLimited     bool
+	suspectReads    []ScanReadLatency
+	ioBytes         int64
+	slowReads       []ScanReadLatency
+	maxReadLatency  *ScanReadLatency
+	bytesRead       int
+	milliseconds    float64
+	badRanges       []BadRange
+	errorCount      int
 }
 
 func (m *JobManager) readRegion(handle ReadHandle, buffer []byte, length int, position int64, job *Job, detailLimit int, probeSize int64) (result readRegionResult, resultErr error) {
@@ -1599,16 +1668,36 @@ func (m *JobManager) readRegion(handle ReadHandle, buffer []byte, length int, po
 		result.suspectReads, result.ioBytes = reader.recheckSnapshot()
 		for i := range result.badRanges {
 			result.badRanges[i] = classifyScanRange(result.badRanges[i])
+			if result.badRanges[i].Code == "SLOW_READ_LIMIT" {
+				result.slowLimited = true
+			}
 		}
 	}()
 	handle = reader
 	started := time.Now()
 	rangeLimit := detailLimit
 	primary, err := m.readWithRetries(handle, buffer, length, position, job)
+	primaryFailure := reader.failureSnapshot()
+	if errors.Is(err, errScanSlowBudget) {
+		ranges := []BadRange{}
+		issueCount := 0
+		if primary.shortRead != nil {
+			appendBadRanges(&ranges, []BadRange{*primary.shortRead}, rangeLimit)
+			issueCount = 1
+		}
+		appendSlowSkippedRange(&ranges, position+int64(primary.bytesRead), int64(length-primary.bytesRead), rangeLimit)
+		return readRegionResult{slowLimited: true, bytesRead: primary.bytesRead, milliseconds: float64(time.Since(started)) / float64(time.Millisecond), badRanges: ranges, errorCount: issueCount}, nil
+	}
 	if err != nil {
 		return readRegionResult{}, err
 	}
 	if e := scanProtocolError(primary.err); e != nil && !localizableScanIssue(e) {
+		if e.Evidence.Kind == "TIMEOUT" && !errors.Is(primary.err, errScanWaitTimeout) {
+			readBytes := scanTimeoutPrefix(primary, position)
+			ranges := []BadRange{scanIssueRange(position, int64(length), primary.err, boolPtr(false))}
+			appendSlowSkippedRange(&ranges, position+int64(readBytes), int64(length-readBytes), rangeLimit)
+			return readRegionResult{slowLimited: true, bytesRead: readBytes, milliseconds: float64(time.Since(started)) / float64(time.Millisecond), badRanges: ranges, errorCount: 1}, nil
+		}
 		// Preserve recovered firmware errors. Retry transient command/transport
 		// failures once, then stop instead of painting a whole disk as bad.
 		recovered := e.Evidence.Kind == "RECOVERED_ERROR" && primary.bytesRead == length
@@ -1638,7 +1727,7 @@ func (m *JobManager) readRegion(handle ReadHandle, buffer []byte, length int, po
 		appendBadRanges(&ranges, []BadRange{scanIssueRange(position, int64(length), primary.err, boolPtr(false))}, rangeLimit)
 		for i := range ranges {
 			ranges[i].Outcome = "unreadable"
-			ranges[i].ProbeBytes = probeSize
+			ranges[i].ProbeBytes = min(probeSize, int64(length))
 		}
 		return readRegionResult{milliseconds: float64(time.Since(started).Nanoseconds()) / 1e6, badRanges: ranges, errorCount: 1}, nil
 	}
@@ -1655,9 +1744,32 @@ func (m *JobManager) readRegion(handle ReadHandle, buffer []byte, length int, po
 		bytesRead = 0
 	}
 	if bytesRead < length {
+		if budget, ok := baseHandle.(*scanSlowBudgetReader); ok && job.Options.ScanDeepLocate != nil && *job.Options.ScanDeepLocate {
+			// The normal five-second region limit must not silently disable
+			// explicitly requested deep localization. scanProbeReader still
+			// bounds this phase by its deadline and number of requests.
+			baseHandle = &scanLocalizationReader{budget}
+		}
 		located, locatedBytes, locateErr := m.locateReadErrors(handle, position+int64(bytesRead), int64(length-bytesRead), job, rangeLimit-len(badRanges), probeSize)
 		bytesRead += locatedBytes
 		appendBadRanges(&badRanges, located, rangeLimit)
+		if primary.err != nil && primaryFailure != nil && sumUnresolvedProbeBytes(located) > 0 {
+			preserved := false
+			for _, issue := range located {
+				if issue.Code != "SLOW_READ_LIMIT" && issue.Code != "LOCALIZATION_LIMIT" {
+					preserved = true
+					break
+				}
+			}
+			if !preserved {
+				issue := scanIssueRange(primaryFailure.Offset, int64(primaryFailure.Bytes), primaryFailure.Err, nil)
+				issue.Outcome = "unresolved"
+				issue.Detail = "读取请求失败，定位未完成；请求范围不代表每个扇区均损坏"
+				// This observation overlaps the unresolved coverage. Do not
+				// count its bytes twice or infer unreadable sectors from it.
+				appendBadRanges(&badRanges, []BadRange{issue}, rangeLimit)
+			}
+		}
 		if locateErr != nil {
 			return readRegionResult{bytesRead: bytesRead, milliseconds: float64(time.Since(started).Nanoseconds()) / 1e6, badRanges: badRanges, errorCount: max(1, len(badRanges))}, locateErr
 		}
@@ -1672,7 +1784,7 @@ func (m *JobManager) readRegion(handle ReadHandle, buffer []byte, length int, po
 	if hadReadIssue && len(badRanges) == 0 && bytesRead == length {
 		recovered := true
 		r := scanIssueRange(position, int64(length), primary.err, &recovered)
-		if scanProtocolError(primary.err) == nil {
+		if r.Code == "EIO" && scanProtocolError(primary.err) == nil {
 			r.Code = "READ_RETRY"
 		}
 		appendBadRanges(&badRanges, []BadRange{r}, rangeLimit)
@@ -1879,6 +1991,16 @@ func (m *JobManager) create(typeName, devicePath string, options map[string]inte
 		return nil, newJobError("不支持的任务类型", "INVALID_JOB_TYPE", 400)
 	}
 	resumeID, _ := options["resumeFrom"].(string)
+	repairFrom, _ := options["scanRepairFrom"].(string)
+	if raw, exists := options["scanRepairFrom"]; exists && (raw != repairFrom || typeName != "scan" || !jobIDPattern.MatchString(repairFrom) || resumeID != "" || options["scanRepair"] != true) {
+		return nil, newJobError("按记录修复需要有效的扫描记录、开启修复且不能同时续扫", "INVALID_ARGUMENT", 400)
+	}
+	var repairSource *Job
+	if repairFrom != "" {
+		m.mu.Lock()
+		repairSource = cloneJobLocked(m.jobs[repairFrom])
+		m.mu.Unlock()
+	}
 	if raw, exists := options["resumeFrom"]; exists && (raw != resumeID || typeName != "scan" || !jobIDPattern.MatchString(resumeID)) {
 		return nil, newJobError("resumeFrom 必须是有效的扫描任务 ID", "INVALID_ARGUMENT", 400)
 	}
@@ -2111,6 +2233,16 @@ func (m *JobManager) create(typeName, devicePath string, options map[string]inte
 			return nil, newJobError("慢扇区修复需要确认写入风险并核对磁盘身份", "SCAN_REPAIR_CONFIRMATION_REQUIRED", 409)
 		}
 	}
+	var repairTargets []RecordedRepairTarget
+	if repairFrom != "" {
+		if repairSource == nil || !scanResumeMatchesDisk(repairSource, disk) {
+			return nil, newJobError("扫描记录与当前硬盘身份或扇区信息不一致", "DISK_CHANGED", 409)
+		}
+		repairTargets, err = recordedRepairTargets(repairSource, float64(repairAfterMs))
+		if err != nil {
+			return nil, err
+		}
+	}
 	if typeName != "speed" && expectedDisk != nil {
 		if diskIdentityChanged(expectedDisk.Path, expectedDisk.Serial, expectedDisk.Model, expectedDisk.Size, disk) {
 			return nil, newJobError("所选磁盘信息已变化，请刷新并重新确认", "DISK_CHANGED", 409)
@@ -2216,6 +2348,15 @@ func (m *JobManager) create(typeName, devicePath string, options map[string]inte
 			r := result.(*ScanResult)
 			r.SamplingPlan, r.SamplingSeed = stratifiedScanPlan, newScanSamplingSeed()
 		}
+		if repairFrom != "" {
+			r := result.(*ScanResult)
+			r.ScanMode, r.Coverage, r.SampleBytes, r.SamplingPlan = "repair", "targeted", nil, ""
+			r.RepairTargets = repairTargets
+			r.Map = make([]ScanCell, len(repairTargets))
+			for i, target := range repairTargets {
+				r.Map[i] = ScanCell{Index: i, Start: target.Read.Offset, End: target.Read.Offset + int64(target.Read.Bytes), Status: "pending"}
+			}
+		}
 	}
 	phase := ""
 	if typeName == "scan" {
@@ -2226,6 +2367,9 @@ func (m *JobManager) create(typeName, devicePath string, options map[string]inte
 		}
 	} else {
 		phase = "准备一键测速"
+	}
+	if repairFrom != "" {
+		phase = "准备按扫描记录修复慢区"
 	}
 
 	optionsField := JobOptions{}
@@ -2257,6 +2401,7 @@ func (m *JobManager) create(typeName, devicePath string, options map[string]inte
 			optionsField.SpeedThreads = intPtr(speedThreadCount)
 		}
 	} else if typeName == "scan" {
+		optionsField.ScanRepairFrom = repairFrom
 		optionsField.ScanMode = strPtr(scanMode)
 		optionsField.ScanExactSectors = boolPtr(scanExactSectors)
 		optionsField.ScanDeepLocate = boolPtr(scanDeepLocate)
@@ -2314,7 +2459,7 @@ func (m *JobManager) create(typeName, devicePath string, options map[string]inte
 
 	m.mu.Lock()
 	// The source may have been deleted while resolving the current disk.
-	if resumeSource != nil && m.jobs[resumeID] == nil {
+	if (resumeSource != nil && m.jobs[resumeID] == nil) || (repairSource != nil && m.jobs[repairFrom] == nil) {
 		m.mu.Unlock()
 		m.removeScanIssueFile(job.ID)
 		return nil, newJobError("原扫描记录已删除，请刷新后重试", "SCAN_RESUME_UNAVAILABLE", 409)
@@ -2341,7 +2486,9 @@ func (m *JobManager) create(typeName, devicePath string, options map[string]inte
 			return
 		}
 		var runErr error
-		if m.mock {
+		if repairFrom != "" {
+			runErr = m.runRecordedRepair(job)
+		} else if m.mock {
 			if typeName == "scan" {
 				runErr = m.runMockScan(job)
 			} else {
@@ -2609,6 +2756,8 @@ func (m *JobManager) runScan(job *Job, scanMode string) (runErr error) {
 			if scanCellComplete(result, cell) {
 				continue
 			}
+			budget := newScanSlowBudgetReader(handle, job.Disk.Rotational)
+			budget.now = m.nowFn
 			m.mu.Lock()
 			ranges := setScanSamples(result, cell, job.Disk.Size, logicalSectorSize, maxSampleLength)
 			m.mu.Unlock()
@@ -2622,12 +2771,13 @@ func (m *JobManager) runScan(job *Job, scanMode string) (runErr error) {
 				cell.Status = "reading"
 				job.Phase = fmt.Sprintf("快速抽样 %d/%d · %d/%d", index+1, len(result.Map), sampleIndex+1, len(ranges))
 				m.mu.Unlock()
-				regionResult, warning, ratio, recheck, err := m.inspectScanRegion(job, cell, handle, repairHandle, buffer, position, int(length), errorProbeLength, latencyReference, loadMonitor)
+				regionResult, warning, ratio, recheck, err := m.inspectScanRegion(job, cell, budget, repairHandle, buffer, position, int(length), errorProbeLength, latencyReference, loadMonitor)
 				if err != nil {
 					m.recordScanReadFailure(job, cell, regionResult, length, badRanges, handle)
 					return err
 				}
 				m.mu.Lock()
+				length = finishSlowLimitedRegion(result, cell, &regionResult, position, length)
 				appendBadRanges(&badRanges, regionResult.badRanges, 200)
 				m.updateCell(cell, regionResult.milliseconds, int64(regionResult.bytesRead), int64(regionResult.errorCount), length)
 				cell.CoveredBytes += length - sumUnresolvedProbeBytes(regionResult.badRanges)
@@ -2640,12 +2790,15 @@ func (m *JobManager) runScan(job *Job, scanMode string) (runErr error) {
 				if recheck != nil {
 					applyScanReadLatency(cell, recheck.MaxReadLatency, job.Disk.Rotational)
 				}
-				if sampleIndex+1 < len(ranges) {
+				if regionResult.slowLimited && cell.ErrorCount == 0 {
+					cell.Status = "severe"
+				}
+				if sampleIndex+1 < len(ranges) && !regionResult.slowLimited {
 					cell.Status = "reading"
 				}
 				updateScanReadInfo(result, handle)
 				job.Progress = round1(float64(index) / float64(len(result.Map)) * 100)
-				if sampleIndex+1 == len(ranges) {
+				if sampleIndex+1 == len(ranges) || regionResult.slowLimited {
 					job.Progress = round1(float64(index+1) / float64(len(result.Map)) * 100)
 				}
 				m.updateScanCellStats(job, before, cell)
@@ -2655,6 +2808,9 @@ func (m *JobManager) runScan(job *Job, scanMode string) (runErr error) {
 					return recordErr
 				}
 				m.persistThrottled(job, false)
+				if regionResult.slowLimited {
+					break
+				}
 			}
 		}
 	} else {
@@ -2664,6 +2820,8 @@ func (m *JobManager) runScan(job *Job, scanMode string) (runErr error) {
 			if scanCellComplete(result, cell) {
 				continue
 			}
+			budget := newScanSlowBudgetReader(handle, job.Disk.Rotational)
+			budget.now = m.nowFn
 			position := cell.Start
 			for position < cell.End {
 				if err := m.checkCancelled(job); err != nil {
@@ -2679,13 +2837,14 @@ func (m *JobManager) runScan(job *Job, scanMode string) (runErr error) {
 				job.Phase = fmt.Sprintf("完整读取 %d/%d", index+1, len(result.Map))
 				m.mu.Unlock()
 
-				regionResult, warning, ratio, recheck, err := m.inspectScanRegion(job, cell, handle, repairHandle, buffer, position, int(length), errorProbeLength, latencyReference, loadMonitor)
+				regionResult, warning, ratio, recheck, err := m.inspectScanRegion(job, cell, budget, repairHandle, buffer, position, int(length), errorProbeLength, latencyReference, loadMonitor)
 				if err != nil {
 					m.recordScanReadFailure(job, cell, regionResult, length, badRanges, handle)
 					return err
 				}
 
 				m.mu.Lock()
+				length = finishSlowLimitedRegion(result, cell, &regionResult, position, length)
 				if recheck != nil {
 					cell.Recheck = mergeScanRecheck(cell.Recheck, recheck)
 				}
@@ -2697,6 +2856,9 @@ func (m *JobManager) runScan(job *Job, scanMode string) (runErr error) {
 				applyScanReadLatency(cell, regionResult.maxReadLatency, job.Disk.Rotational)
 				if recheck != nil {
 					applyScanReadLatency(cell, recheck.MaxReadLatency, job.Disk.Rotational)
+				}
+				if regionResult.slowLimited && cell.ErrorCount == 0 {
+					cell.Status = "severe"
 				}
 				updateScanReadInfo(result, handle)
 				position += length
@@ -2739,10 +2901,10 @@ func (m *JobManager) runScan(job *Job, scanMode string) (runErr error) {
 	if scanMode == "full" {
 		modeLabel = "完整扫描"
 	}
-	message := scanOutcomeCompletionMessage(modeLabel, result, errorCells, slowCells)
+	message := scanOutcomeCompletionMessage(modeLabel, result, errorCells, slowCells, job.Disk.Rotational)
 	if scanRepairThreshold(job) > 0 {
 		r := result.Stats.Repair
-		message += fmt.Sprintf("；慢区写回：%d 个校验通过，%d 个仍慢，%d 个跳过，%d 个失败", r.Verified, r.StillSlow, r.Skipped, r.Failed)
+		message += fmt.Sprintf("；慢区写回：%d 个写回校验通过，%d 个慢速改善，%d 个修复后仍慢，%d 个跳过，%d 个失败", r.Verified+r.StillSlow, r.Improved, r.StillSlow, r.Skipped, r.Failed)
 	}
 	if result.Diagnostics != nil && result.Diagnostics.SelfTest != nil && result.Diagnostics.SelfTest.State != "passed" {
 		message += "；固件自检另有异常，请查看详情"
@@ -2853,6 +3015,11 @@ func (m *JobManager) runMockScan(job *Job) error {
 		if full && errorCount == 0 && scanUnitLatency(milliseconds, timingBytes) >= 50 {
 			cell.Recheck = &ScanRecheck{Outcome: "slow", Reads: 8, BytesRead: timingBytes, MaxUnitMs: scanUnitLatency(milliseconds, timingBytes)}
 		}
+		_, _, severeThreshold := scanReadThresholds(job.Disk.Rotational)
+		if errorCount == 0 && requestMs >= severeThreshold {
+			// Synthetic persistent-slow evidence for the demo only.
+			cell.SlowBadBlock = &ScanSlowBlock{Offset: requestOffset, Bytes: int(min(timingBytes, scanLatencyRequestBytes)), FirstMs: requestMs, RepeatMs: requestMs, Source: "recheck", Load: &ScanLoad{}}
+		}
 		if full {
 			reads := int64(math.Ceil(float64(bytesRead) / float64(fullScanReadSize)))
 			if reads < 1 {
@@ -2907,7 +3074,7 @@ func (m *JobManager) runMockScan(job *Job) error {
 	if full {
 		modeLabel = "完整扫描"
 	}
-	message := scanOutcomeCompletionMessage("演示"+modeLabel, result, errorCells, result.Stats.SlowCells)
+	message := scanOutcomeCompletionMessage("演示"+modeLabel, result, errorCells, result.Stats.SlowCells, job.Disk.Rotational)
 	m.mu.Lock()
 	result.Diagnostics = &ScanDiagnostics{ReadMethod: "mock", Before: mockEvidence, After: mockEvidence}
 	m.mu.Unlock()

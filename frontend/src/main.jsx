@@ -1,7 +1,8 @@
-import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { createRoot } from "react-dom/client";
 import {
   AlertTriangle,
+  ArrowLeft,
   Activity,
   Check,
   ChevronDown,
@@ -27,6 +28,7 @@ import {
   detailRetryDelay,
   estimateRemainingMilliseconds,
   findCurrentDiskForJob,
+  findLatestScanJob,
   findResumableScan,
   formatEstimatedDuration,
   isCompleteScanResult,
@@ -37,15 +39,30 @@ import {
   mergeScanProgress,
   rawSpeedDiskBlockedReason,
   scanRepairDiskBlockedReason,
+  recordedRepairCandidates,
+  isCompleteRecordedRepairResult,
   safeScanMap,
   scanOutcomeSummary,
+  scanIssueDisplayCount,
+  scanAbnormalCellCount,
+	 scanBadBlockSummary,
+	 scanBadBlockKind,
+	 scanSlowBadBlock,
   scanRangeOutcomeLabel,
+  mergeTimeoutSkipRanges,
+  scanRepairStages,
+  scanRepairSpeedNote,
+  scanRangeLocation,
+  scanCellLocationSummary,
   validScanIssuePage,
   scanStatusGroup,
+  speedBenchmarkCells,
   storageSpaceUsesOnlySolidStateDisks,
   storageSpacesForDisk,
   terminalScanPrefix
 } from "./job-model.js";
+import { createSmartReportCache, smartReportKey } from "./smart-report-cache.js";
+import { ImmediateTooltip, ImmediateTooltipProvider } from "./immediate-tooltip.jsx";
 import "./styles.css";
 
 const API = `${import.meta.env.BASE_URL.replace(/\/$/, "")}/api`;
@@ -272,8 +289,9 @@ function formatInteger(value) {
   return new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 }).format(Math.floor(value));
 }
 
-function formatMilliseconds(value) {
+function formatMilliseconds(value, precise = false) {
   if (!Number.isFinite(value)) return "-";
+  if (precise && value < 1) return `${value.toFixed(2)} ms`;
   return `${value < 10 ? value.toFixed(1) : Math.round(value)} ms`;
 }
 
@@ -306,7 +324,13 @@ function smartStatusMeta(disk) {
 
 function criticalAttributeRows(disk) {
   if (!isRecord(disk)) return [];
-  const value = (candidate) => Number.isFinite(candidate) ? candidate : 0;
+  const value = (candidate) => Number.isFinite(candidate) ? candidate : null;
+  if (disk.transport?.toLowerCase() === "nvme" || disk.nvmeMediaErrors != null || disk.criticalWarning != null) {
+    return [
+      ["介质与数据错误", value(disk.nvmeMediaErrors), "NVMe 介质与数据完整性错误累计次数，不等于本次扫描确认的坏扇区数量"],
+      ["严重告警标志", value(disk.criticalWarning), "NVMe Critical Warning 位掩码；0 表示设备未报告此类告警，缺失时不作正常判断"]
+    ];
+  }
   return [
     ["重映射扇区", value(disk.reallocatedSectors), "ATA 属性 5：已被备用扇区替换的坏扇区数"],
     ["待重映射扇区", value(disk.pendingSectors), "ATA 属性 197：读不稳定、等待写入验证后重映射的扇区"],
@@ -348,8 +372,22 @@ function createPendingMap(diskSize, count = SCAN_CELL_COUNT) {
   }));
 }
 
-function DiskDetails({ disk, showHealth = true }) {
+async function fetchSmartReport(disk) {
+  const data = await api(`/disks/smart?${new URLSearchParams({ device: disk.path })}`, { timeoutMs: 35_000 });
+  const report = data.smart;
+  if (!isRecord(report) || report.device !== disk.path || typeof report.output !== "string" || !report.output.trim()) {
+    throw new Error("SMART 信息响应格式不正确");
+  }
+  return report;
+}
+
+function DiskDetails({ disk, showHealth = true, smartCache }) {
   const [smartOpen, setSmartOpen] = useState(false);
+  const smartState = useSyncExternalStore(smartCache.subscribe, () => smartCache.get(disk));
+  const diskKey = smartReportKey(disk);
+  useEffect(() => {
+    if (showHealth) smartCache.load(disk);
+  }, [smartCache, diskKey, showHealth]);
   const [smartLabel, smartTone] = smartStatusMeta(disk);
   const criticalRows = criticalAttributeRows(disk);
   const mountpoints = Array.isArray(disk.mountpoints)
@@ -357,12 +395,12 @@ function DiskDetails({ disk, showHealth = true }) {
     : [];
   return <>
     <dl className="device-specs">
-      <div><dt>型号</dt><dd title={disk.model || "未知型号"}>{disk.model || "未知型号"}</dd></div>
+      <div><dt>型号</dt><dd data-tooltip={disk.model || "未知型号"}>{disk.model || "未知型号"}</dd></div>
       <div><dt>容量</dt><dd>{formatBytes(disk.size)}</dd></div>
       <div><dt>接口</dt><dd>{disk.transport?.toUpperCase() || "-"}</dd></div>
-      <div><dt>固件版本</dt><dd title={disk.firmware || "未提供"}>{disk.firmware || "-"}</dd></div>
-      <div><dt>序列号</dt><dd title={disk.serial || "未提供"}>{disk.serial || "未提供"}</dd></div>
-      <div><dt>挂载位置</dt><dd title={mountpoints.join(", ")}>{mountpoints.length ? mountpoints.join(", ") : "未挂载"}</dd></div>
+      <div><dt>固件版本</dt><dd data-tooltip={disk.firmware || "未提供"}>{disk.firmware || "-"}</dd></div>
+      <div><dt>序列号</dt><dd data-tooltip={disk.serial || "未提供"}>{disk.serial || "未提供"}</dd></div>
+      <div><dt>挂载位置</dt><dd data-tooltip={mountpoints.join(", ")}>{mountpoints.length ? mountpoints.join(", ") : "未挂载"}</dd></div>
       <div><dt>逻辑扇区</dt><dd>{formatBinaryBytes(disk.logicalSectorSize)}</dd></div>
       <div><dt>物理扇区</dt><dd>{formatBinaryBytes(disk.physicalSectorSize)}</dd></div>
       <div><dt>系统访问</dt><dd>{disk.readOnly ? "只读" : "可读写"}</dd></div>
@@ -379,23 +417,24 @@ function DiskDetails({ disk, showHealth = true }) {
       {criticalRows.length > 0 && <div className="critical-metrics">
         <dl className="health-metrics">
           {criticalRows.map(([label, value, hint]) => <div key={label}>
-            <dt title={hint}>{label}</dt>
-            <dd className={value > 0 ? "value-danger" : ""} title={hint}>{formatInteger(value)}</dd>
+            <dt data-tooltip={hint}>{label}</dt>
+            <dd className={value > 0 ? "value-danger" : ""} data-tooltip={value == null ? "设备未提供此项信息" : hint}>{value == null ? "未提供" : formatInteger(value)}</dd>
           </div>)}
         </dl>
       </div>}
       <div className="disk-state">
         {disk.isSystem && <span className="badge badge-warning"><AlertTriangle size={13} /> 系统盘</span>}
         <span className="badge badge-neutral">{disk.rotational ? "HDD" : "SSD"}</span>
-        <button type="button" className="badge badge-success smart-info-button" aria-haspopup="dialog" title="查看原始 SMART 信息" onClick={() => setSmartOpen(true)}><ShieldCheck size={13} aria-hidden="true" /> SMART 信息</button>
+        <button type="button" className={`badge badge-${smartTone} smart-info-button`} aria-haspopup="dialog" data-tooltip="查看原始 SMART 信息" onClick={() => setSmartOpen(true)}><ShieldCheck size={13} aria-hidden="true" /> SMART 信息</button>
       </div>
     </div>}
-    {smartOpen && <SmartInfoDialog disk={disk} onClose={() => setSmartOpen(false)} />}
+    {smartOpen && <SmartInfoDialog disk={disk} state={smartState} onRefresh={() => smartCache.load(disk, true)} onClose={() => setSmartOpen(false)} />}
   </>;
 }
 
 function DiskSelector({ disks, selected, onSelect, loading, locked, onRefresh, refreshing, availabilityError, mode, speedTargets, selectedSpeedTarget, onSelectSpeedTarget, theme, onToggleTheme }) {
 	const speedMode = mode === "speed";
+  const [smartCache] = useState(() => createSmartReportCache(fetchSmartReport));
   const [detailsExpanded, setDetailsExpanded] = useState(false);
   const [memberDetailPath, setMemberDetailPath] = useState("");
   useEffect(() => setDetailsExpanded(false), [mode, selected?.path, selectedSpeedTarget?.key]);
@@ -418,11 +457,14 @@ function DiskSelector({ disks, selected, onSelect, loading, locked, onRefresh, r
             <button
               className="icon-button device-refresh"
               type="button"
-              onClick={onRefresh}
+              onClick={() => {
+                onRefresh();
+                if (!speedMode && detailDisk) smartCache.load(detailDisk, true);
+              }}
               disabled={refreshing}
               aria-label={refreshing ? "正在刷新磁盘和任务" : "刷新磁盘和任务"}
               aria-busy={refreshing ? "true" : undefined}
-              title={refreshing ? "正在刷新" : "刷新磁盘和任务"}
+              data-tooltip={refreshing ? "正在刷新" : "刷新磁盘和任务"}
             >
               <RefreshCw size={16} className={refreshing ? "spin" : ""} aria-hidden="true" />
             </button>
@@ -432,7 +474,7 @@ function DiskSelector({ disks, selected, onSelect, loading, locked, onRefresh, r
               onClick={onToggleTheme}
               aria-label={theme === "dark" ? "切换到浅色主题" : "切换到深色主题"}
               aria-pressed={theme === "dark"}
-              title={theme === "dark" ? "浅色主题" : "深色主题"}
+              data-tooltip={theme === "dark" ? "浅色主题" : "深色主题"}
             >
               <span className="theme-light" aria-hidden="true"><Sun size={16} /></span>
               <span className="theme-dark" aria-hidden="true"><Moon size={16} /></span>
@@ -492,7 +534,7 @@ function DiskSelector({ disks, selected, onSelect, loading, locked, onRefresh, r
               {memberDisks.map((disk) => <option key={disk.path} value={disk.path}>{disk.model || "未知型号"} · {disk.path}</option>)}
             </select>
           </label>}
-          {detailDisk ? <DiskDetails key={detailDisk.path} disk={detailDisk} showHealth={!speedMode} /> : <p className="disk-detail-unavailable">未识别到对应的物理磁盘，暂无法显示硬盘详情。</p>}
+          {detailDisk ? <DiskDetails key={smartReportKey(detailDisk)} disk={detailDisk} showHealth={!speedMode} smartCache={smartCache} /> : <p className="disk-detail-unavailable">未识别到对应的物理磁盘，暂无法显示硬盘详情。</p>}
           {speedMode && selectedStorageSpace && <div className="speed-target-details">
 		    <dl className="device-specs">
 		      <div><dt>{/^\/vol\d+$/.test(selectedStorageSpace.path) ? "存储空间" : "外接挂载"}</dt><dd>{selectedStorageSpace.path}</dd></div>
@@ -500,7 +542,7 @@ function DiskSelector({ disks, selected, onSelect, loading, locked, onRefresh, r
 		      <div><dt>文件系统</dt><dd>{String(selectedStorageSpace.fileSystem || "-").toUpperCase()}</dd></div>
 		      <div><dt>总容量</dt><dd>{formatBytes(selectedStorageSpace.size)}</dd></div>
 		      <div><dt>可用空间</dt><dd>{formatBytes(selectedStorageSpace.freeBytes)}</dd></div>
-		      <div><dt>成员盘</dt><dd title={storageMembers.join(" + ")}>{storageMembers.length ? storageMembers.map((member) => member.replace(/^\/dev\//, "")).join(" + ") : "未知"}</dd></div>
+		      <div><dt>成员盘</dt><dd data-tooltip={storageMembers.join(" + ")}>{storageMembers.length ? storageMembers.map((member) => member.replace(/^\/dev\//, "")).join(" + ") : "未知"}</dd></div>
 		    </dl>
 		    <div className="disk-state">
 		      <span className="badge badge-neutral">{storageLayoutLabel(selectedStorageSpace)}</span>
@@ -552,9 +594,10 @@ function ScanRepairSummary({ job }) {
     <div className="scan-repair-result" role="group" aria-label="慢扇区写回结果">
       <strong>慢扇区写回 · 阈值 {job.options.scanRepairAfterMs || 500} ms</strong>
       {job.result
-        ? <p>候选 {repair.candidates || 0} · 数据校验通过 {(repair.verified || 0) + (repair.stillSlow || 0)} · 其中仍慢 {repair.stillSlow || 0} · 跳过 {repair.skipped || 0} · 失败 {repair.failed || 0} · {ACTIVE.has(job.status) ? "处理中" : "结果未确定"} {repair.pending || 0}</p>
+        ? <p>候选 {repair.candidates || 0} · 写回校验通过 {(repair.verified || 0) + (repair.stillSlow || 0)} · 慢速改善 {repair.improved || 0} · 修复后仍慢 {repair.stillSlow || 0} · 跳过 {repair.skipped || 0} · 失败 {repair.failed || 0} · {ACTIVE.has(job.status) ? "处理中" : "结果未确定"} {repair.pending || 0}</p>
         : <p>正在加载写回统计…</p>}
-      <p>首次慢响应仍保留。写回校验通过不能保证物理损伤已修复。原始数据备份保存在应用数据目录 repair-backups/{job.id}；删除历史不会删除备份。</p>
+      <p>写回校验通过表示数据一致；同范围连续复测恢复到门槛以内，才记为慢速改善。首次慢响应和原始数据备份保留。</p>
+      {repair.stillSlow > 0 && <p className="value-danger">修复后仍慢：已停止对这些地址反复写入，建议更换硬盘。</p>}
     </div>
   );
 }
@@ -614,8 +657,8 @@ function SpeedSettingsDialog({ speedConfig, health, speedTarget, controlsLocked,
           </div>
           <fieldset className="speed-extra-options">
             <legend className="sr-only">附加选项</legend>
-            <label title="绕过系统页缓存，测量更接近存储介质的性能"><input type="checkbox" checked={draft.speedDirectIO} onChange={(event) => setDraft((current) => ({ ...current, speedDirectIO: event.target.checked }))} /><span>Direct I/O</span></label>
-            <label className={trimAvailable ? "" : "disabled"} title={trimTitle}><input type="checkbox" checked={trimTargetAllowed && draft.speedTrim} disabled={!trimAvailable} onChange={(event) => setDraft((current) => ({ ...current, speedTrim: event.target.checked }))} /><span>测速前 TRIM</span></label>
+            <label data-tooltip="绕过系统页缓存，测量更接近存储介质的性能"><input type="checkbox" checked={draft.speedDirectIO} onChange={(event) => setDraft((current) => ({ ...current, speedDirectIO: event.target.checked }))} /><span>Direct I/O</span></label>
+            <label className={trimAvailable ? "" : "disabled"} data-tooltip={trimTitle}><input type="checkbox" checked={trimTargetAllowed && draft.speedTrim} disabled={!trimAvailable} onChange={(event) => setDraft((current) => ({ ...current, speedTrim: event.target.checked }))} /><span>测速前 TRIM</span></label>
           </fieldset>
         </fieldset>
       </div>
@@ -640,7 +683,7 @@ function TaskSetup({ mode, scanMode, setScanMode, scanExactSectors, setScanExact
     ? "系统缺少 lsblk，无法识别可检测的物理磁盘。"
     : "系统缺少 fio，无法执行测速。";
   const repairBlockedReason = scanRepairDiskBlockedReason(disk);
-  const repairEnabled = mode === "scan" && scanRepair;
+  const repairEnabled = mode === "scan" && (scanRepair || Boolean(activeJob?.options?.scanRepairFrom));
   const repairThresholdValid = Number.isInteger(Number(scanRepairAfterMs)) && Number(scanRepairAfterMs) >= 1 && Number(scanRepairAfterMs) <= 60000;
   const stopping = activeJob?.status === "cancelling" || cancelPending;
   const startLabel = mode === "speed"
@@ -694,7 +737,7 @@ function TaskSetup({ mode, scanMode, setScanMode, scanExactSectors, setScanExact
           <p className="eyebrow">Test profile</p>
           <div className="task-heading-title">
             <h2 id="test-heading">检测配置</h2>
-            {mode === "speed" && <button ref={speedSettingsTriggerRef} type="button" className="icon-button speed-settings-trigger" disabled={controlsLocked} aria-label="测速设置" title="测速设置" aria-haspopup="dialog" aria-controls="speed-settings-dialog" onClick={() => setSpeedSettingsOpen(true)}><Settings2 size={16} aria-hidden="true" /></button>}
+            {mode === "speed" && <button ref={speedSettingsTriggerRef} type="button" className="icon-button speed-settings-trigger" disabled={controlsLocked} aria-label="测速设置" data-tooltip="测速设置" aria-haspopup="dialog" aria-controls="speed-settings-dialog" onClick={() => setSpeedSettingsOpen(true)}><Settings2 size={16} aria-hidden="true" /></button>}
           </div>
         </div>
         <div className="task-meta">
@@ -719,7 +762,7 @@ function TaskSetup({ mode, scanMode, setScanMode, scanExactSectors, setScanExact
             onClick={() => activeJob ? onCancel(activeJob.id) : onStart(startOptions)}
             disabled={actionDisabled}
             aria-busy={stopping || submitting || finishing ? "true" : undefined}
-            title={[actionTitle, !activeJob && speedFileNote].filter(Boolean).join("\n")}
+            data-tooltip={[actionTitle, !activeJob && speedFileNote].filter(Boolean).join("\n")}
             aria-describedby={!activeJob && speedFileNote ? "speed-temp-file-note" : undefined}
           >
             {activeJob
@@ -753,23 +796,25 @@ function TaskSetup({ mode, scanMode, setScanMode, scanExactSectors, setScanExact
         {mode === "scan" && (
           <fieldset className="speed-extra-options scan-extra-options">
             <legend className="sr-only">扫描附加选项</legend>
-            {/^\/dev\/nvme\d+(?:c\d+)?n\d+$/.test(disk?.path || "") && <label title={health?.capabilities?.mock ? "演示模式不执行固件自检" : "先运行设备支持的 NVMe 固件扩展自检，再进行读取扫描；会增加检测时间，不支持时提示停止。取消任务会尝试中止本次自检。"}>
+            {/^\/dev\/nvme\d+(?:c\d+)?n\d+$/.test(disk?.path || "") && <label data-tooltip={health?.capabilities?.mock ? "演示模式不执行固件自检" : "先运行设备支持的 NVMe 固件扩展自检，再进行读取扫描；会增加检测时间，不支持时提示停止。取消任务会尝试中止本次自检。"}>
               <input type="checkbox" checked={scanSelfTest && !health?.capabilities?.mock} disabled={health?.capabilities?.mock === true} onChange={(event) => setScanSelfTest(event.target.checked)} />
               <span>NVMe 固件自检（可选）</span>
             </label>}
-            <label title="发现读取异常后细分到逻辑扇区；达到定位预算时保留待细查范围，继续后面的扫描">
+            <label data-tooltip="发现读取异常后细分到逻辑扇区；达到定位预算时保留待细查范围，继续后面的扫描">
               <input type="checkbox" checked={scanExactSectors} onChange={(event) => setScanExactSectors(event.target.checked)} />
               <span>精确定位错误扇区</span>
             </label>
-            <select className="scan-probe-mode" aria-label="异常定位预算" value={scanDeepLocate ? "deep" : "standard"} onChange={(event) => setScanDeepLocate(event.target.value === "deep")} title="每个异常范围：标准最多 256 次／15 秒内提交新请求；深入最多 4096 次／2 分钟。已提交的读取仍需等待设备返回。">
+            <select className="scan-probe-mode" aria-label="异常定位预算" value={scanDeepLocate ? "deep" : "standard"} onChange={(event) => setScanDeepLocate(event.target.value === "deep")} data-tooltip="每个异常范围：标准最多 256 次／15 秒内提交新请求；深入最多 4096 次／2 分钟。已提交的读取仍需等待设备返回。">
               <option value="standard">标准定位</option>
               <option value="deep">深入定位</option>
             </select>
             <div className="scan-repair-option">
-              <label title={repairBlockedReason ? `修复慢扇区不可用：${repairBlockedReason}` : undefined} className={repairBlockedReason ? "disabled" : ""}>
-                <input type="checkbox" checked={scanRepair} disabled={Boolean(repairBlockedReason)} aria-describedby={repairBlockedReason ? "scan-repair-blocked-reason" : undefined} onChange={(event) => setScanRepair(event.target.checked)} />
-                <span>修复慢扇区</span>
-              </label>
+              <ImmediateTooltip text={repairBlockedReason ? `修复慢扇区不可用：${repairBlockedReason}` : ""} focusable={Boolean(repairBlockedReason)}>
+                <label className={repairBlockedReason ? "disabled" : ""}>
+                  <input type="checkbox" checked={scanRepair} disabled={Boolean(repairBlockedReason)} aria-describedby={repairBlockedReason ? "scan-repair-blocked-reason" : undefined} onChange={(event) => setScanRepair(event.target.checked)} />
+                  <span>修复慢扇区</span>
+                </label>
+              </ImmediateTooltip>
               {repairEnabled && <label className="scan-repair-threshold">
                 <span>超过</span>
                 <input id="scan-repair-threshold" type="number" inputMode="numeric" min="1" max="60000" step="1" value={scanRepairAfterMs} onChange={(event) => setScanRepairAfterMs(event.target.value)} aria-label="慢扇区修复阈值（毫秒）" aria-describedby={!repairThresholdValid ? "scan-repair-error" : undefined} aria-invalid={!repairThresholdValid} />
@@ -777,7 +822,7 @@ function TaskSetup({ mode, scanMode, setScanMode, scanExactSectors, setScanExact
               </label>}
             </div>
             {repairBlockedReason && <span id="scan-repair-blocked-reason" className="sr-only">修复慢扇区不可用：{repairBlockedReason}</span>}
-            <ScanRepairSummary job={resultJob} />
+            {!resultJob?.options?.scanRepairFrom && <ScanRepairSummary job={resultJob} />}
           </fieldset>
         )}
         {repairEnabled && !repairThresholdValid && <p id="scan-repair-error" className="scan-repair-error value-danger" role="alert">请输入 1～60000 的整数。</p>}
@@ -824,6 +869,18 @@ function TaskSetup({ mode, scanMode, setScanMode, scanExactSectors, setScanExact
   );
 }
 
+function ScanRepairEvidence({ repair, job }) {
+  const threshold = Math.min(job.options?.scanRepairAfterMs ?? 500, job.disk?.rotational ? 800 : 500);
+  const note = ["verified", "still_slow"].includes(repair.outcome)
+    ? (repair.speedChecks?.length === 2 ? scanRepairSpeedNote(repair, threshold) : "") : repair.detail;
+  return <>
+    <div className="scan-repair-stages">{scanRepairStages(repair).map((stage) => <span key={stage.label}>
+      {stage.label} {stage.text ?? (stage.values ? `${stage.values.map((ms) => formatMilliseconds(ms, true).replace(/ ms$/, "")).join(" / ")} ms` : formatMilliseconds(stage.ms, true))}
+    </span>)}</div>
+    {note && <small>{note}</small>}
+  </>;
+}
+
 function ScanIssueBrowser({ job }) {
   const [offset, setOffset] = useState(0);
   const [revision, setRevision] = useState(0);
@@ -831,12 +888,13 @@ function ScanIssueBrowser({ job }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const limit = 50;
-  const logicalSectorSize = Number(job.disk?.logicalSectorSize) || 512;
+  const logicalSectorSize = job.disk?.logicalSectorSize;
+  const sectorBytes = scanRangeLocation(null, logicalSectorSize).sectorBytes;
   useEffect(() => {
     const controller = new AbortController();
     setLoading(true);
     setError("");
-    api(`/jobs/${job.id}/scan-issues?offset=${offset}&limit=${limit}`, { signal: controller.signal })
+    api(`/jobs/${job.id}/scan-issues?view=ranges&offset=${offset}&limit=${limit}`, { signal: controller.signal })
       .then((response) => {
         if (!validScanIssuePage(response.issues, job.disk.size, offset)) throw new Error("异常明细响应不完整");
         if (!controller.signal.aborted) setPage(response.issues);
@@ -845,8 +903,7 @@ function ScanIssueBrowser({ job }) {
       .finally(() => { if (!controller.signal.aborted) setLoading(false); });
     return () => controller.abort();
   }, [job.id, job.disk.size, offset, revision]);
-  const outcome = scanOutcomeSummary(job);
-  const count = outcome?.issueCount ?? job.result?.stats?.badRanges?.length ?? 0;
+  const count = scanIssueDisplayCount(job);
   if (!count) return null;
   const current = page?.offset === offset ? page : null;
   const totalPages = Math.max(1, Math.ceil((current?.total ?? count) / limit));
@@ -861,16 +918,22 @@ function ScanIssueBrowser({ job }) {
         {error && <div className="inline-alert warning" role="alert"><AlertTriangle size={16} /><span>{error}</span></div>}
         {current && <>
           {(current.legacy || !current.complete) && <p className="scan-record-note">{current.legacy ? "旧记录仅保留原有摘要，无法确认异常地址是否完整。" : "异常记录不完整，请同时查看报告中的保存告警。"}</p>}
+          <p className="scan-record-note">{sectorBytes ? `逻辑扇区 ${formatInteger(sectorBytes)} B · LBA 从 0 编号，起止均包含` : "逻辑扇区大小未记录，仅显示字节地址"}</p>
           <div className="scan-issues-table-wrap">
             <table className="scan-issues-table">
               <caption className="sr-only">扫描异常范围及读取结论</caption>
-              <thead><tr><th scope="col">LBA 范围</th><th scope="col">读取结论</th><th scope="col">错误证据</th><th scope="col">定位单位</th></tr></thead>
-              <tbody>{current.records.map((range, index) => <tr key={`${offset + index}`}>
-                <td>{formatInteger(Math.floor(range.offset / logicalSectorSize))}–{formatInteger(Math.ceil((range.offset + range.length) / logicalSectorSize) - 1)}</td>
-                <td>{scanRangeOutcomeLabel(range)}</td>
-                <td title={range.repair?.detail || range.code}>{range.repair ? `首次 ${formatMilliseconds(range.repair.beforeMs)}${range.repair.afterMs != null ? ` · 写回后 ${formatMilliseconds(range.repair.afterMs)}` : ""}${range.repair.detail ? ` · ${range.repair.detail}` : ""}` : (range.code === "EIO" ? "I/O 错误，原因未细分" : range.code === "TIMEOUT" ? "读取超时" : range.code === "TRANSPORT_ERROR" ? "连接或传输错误" : range.code === "MEDIUM_ERROR" ? "设备报告介质错误" : range.code === "SHORT_READ" ? "未完整读取" : range.code)}</td>
-                <td>{range.probeBytes > 0 ? formatBinaryBytes(range.probeBytes) : "请求范围"}</td>
-              </tr>)}</tbody>
+              <thead><tr><th scope="col">{sectorBytes ? "起止 LBA" : "字节地址"}</th><th scope="col">读取结论</th><th scope="col">检测证据</th><th scope="col">定位结果</th></tr></thead>
+              <tbody>{current.records.map((range, index) => {
+                const location = scanRangeLocation(range, logicalSectorSize);
+                const skipped = range.skippedRange;
+                const skippedLocation = skipped ? scanRangeLocation(skipped, logicalSectorSize) : null;
+                return <tr key={`${offset + index}`}>
+                  <td>{location.startLba == null ? `${formatInteger(range.offset)}–${formatInteger(range.offset + range.length - 1)} B` : `${formatInteger(location.startLba)}–${formatInteger(location.endLba)}`}<small>{formatBinaryBytes(range.length)}</small>{skipped && <small>跳过 {skippedLocation.startLba == null ? `${formatInteger(skipped.offset)}–${formatInteger(skipped.offset + skipped.length - 1)} B` : `LBA ${formatInteger(skippedLocation.startLba)}–${formatInteger(skippedLocation.endLba)}`} · {formatBinaryBytes(skipped.length)}</small>}</td>
+                  <td>{scanRangeOutcomeLabel(range)}</td>
+                  <td>{range.repair ? <ScanRepairEvidence repair={range.repair} job={job} /> : skipped ? "读取超时；跳过部分未完成读取检测" : range.detail || (range.code === "EIO" ? "I/O 错误，原因未细分" : range.code === "TIMEOUT" ? "读取超时" : range.code === "TRANSPORT_ERROR" ? "连接或传输错误" : range.code === "MEDIUM_ERROR" ? "设备报告介质错误" : range.code === "SHORT_READ" ? "未完整读取" : range.code)}</td>
+                  <td>{location.label}{["sector", "range"].includes(location.precision) && <small>定位单位 {formatInteger(range.probeBytes)} B</small>}</td>
+                </tr>;
+              })}</tbody>
             </table>
           </div>
           {!current.records.length && <p>当前没有异常记录。</p>}
@@ -882,7 +945,7 @@ function ScanIssueBrowser({ job }) {
             <button type="button" className="button secondary" disabled={loading || currentPage >= totalPages} onClick={() => setOffset((totalPages - 1) * limit)}>末页</button>
           </nav>
         </>}
-        <p className="scan-record-note">明细显示本次加载时的记录。失败范围按定位精度记录，不能推断范围内每个扇区都已损坏。</p>
+        <p className="scan-record-note">逐扇区确认表示已定位到单个不可读逻辑扇区；范围确认不代表每个扇区均损坏。待定位范围不计为已确认坏扇区；慢读及修复记录显示请求范围。</p>
     </div>
   );
 }
@@ -942,33 +1005,14 @@ function ScanEvidenceDetails({ diagnostics }) {
   </section>;
 }
 
-function SmartInfoDialog({ disk, onClose }) {
-  const [refreshKey, setRefreshKey] = useState(0);
-  const [state, setState] = useState({ loading: true, report: null, error: "" });
-  useEffect(() => {
-    const controller = new AbortController();
-    setState({ loading: true, report: null, error: "" });
-    api(`/disks/smart?${new URLSearchParams({ device: disk.path })}`, { signal: controller.signal, timeoutMs: 35_000 })
-      .then((data) => {
-        if (controller.signal.aborted) return;
-        const report = data.smart;
-        if (!isRecord(report) || report.device !== disk.path || typeof report.output !== "string" || !report.output.trim()) {
-          throw new Error("SMART 信息响应格式不正确");
-        }
-        setState({ loading: false, report, error: "" });
-      })
-      .catch((error) => {
-        if (!controller.signal.aborted) setState({ loading: false, report: null, error: errorMessage(error) });
-      });
-    return () => controller.abort();
-  }, [disk.path, refreshKey]);
+function SmartInfoDialog({ disk, state, onRefresh, onClose }) {
   const report = state.report;
   return <ScanResultDialog title="原始 SMART 信息" className="smart-report-dialog" onClose={onClose} actions={
-    <button type="button" className="button secondary" disabled={state.loading} onClick={() => setRefreshKey((value) => value + 1)}><RefreshCw size={15} aria-hidden="true" />{state.error ? "重试" : "刷新"}</button>
+    <button type="button" className="button secondary" disabled={state.loading} onClick={onRefresh}><RefreshCw size={15} aria-hidden="true" />{state.error ? "重试" : "刷新"}</button>
   }>
     <p className="smart-report-meta">{report?.model || disk.model} · {disk.path}{report?.capturedAt && <span>{formatTime(report.capturedAt)}</span>}</p>
     {state.loading && <p className="smart-report-loading" role="status"><LoaderCircle size={18} className="spin" aria-hidden="true" />正在读取 SMART 信息…</p>}
-    {state.error && <p className="inline-alert danger" role="alert">{state.error}</p>}
+    {state.error && <p className="inline-alert danger" role="alert">{errorMessage(state.error)}</p>}
     {report?.mock && <p className="scan-record-note">本地演示数据，未查询真实硬盘。</p>}
     {report?.warning && <p className="inline-alert" role="status">{report.warning}</p>}
     {report && <pre className="smart-report-output" tabIndex={0} aria-label="SMART 原始输出">{report.output}</pre>}
@@ -992,15 +1036,85 @@ function ScanResultDialog({ title, onClose, reportUrl, children, actions, classN
       <div className="scan-result-dialog-body">{children}</div>
       <div className="dialog-actions">
         {actions}
-        {reportUrl && <a className="button secondary" href={reportUrl} download>导出扫描报告</a>}
+        {reportUrl && <a className="button secondary" href={reportUrl} data-tooltip="下载可离线阅读、打印或保存为 PDF 的扫描报告" download>导出扫描报告</a>}
         <button type="button" className="button secondary" onClick={onClose}>关闭</button>
       </div>
     </dialog>
   );
 }
 
-const ScanCellButton = React.memo(function ScanCellButton({ cell, columnCount, inspected, pinned, keyboard, revealed, writeMode }) {
-  const displayStatus = revealed && cell.status !== "reading" ? scanStatusGroup(cell.status, cell.maxUnitMs) : "pending";
+function RecordedRepairDialog({ request, submitting, error, onClose, onConfirm }) {
+  const dialogRef = useRef(null);
+  const { job, disk } = request;
+  const [threshold, setThreshold] = useState(disk.rotational ? 800 : 500);
+  const [confirmation, setConfirmation] = useState("");
+  const [acknowledged, setAcknowledged] = useState(false);
+  const validThreshold = Number.isInteger(Number(threshold)) && Number(threshold) >= 1 && Number(threshold) <= 60000;
+  const candidates = validThreshold ? recordedRepairCandidates(job, Number(threshold)) : [];
+  useLayoutEffect(() => {
+    const previousFocus = document.activeElement;
+    const dialog = dialogRef.current;
+    dialog.showModal();
+    return () => { dialog.close(); previousFocus?.focus?.(); };
+  }, []);
+  return <dialog ref={dialogRef} className="confirm-dialog" role="alertdialog" aria-labelledby="recorded-repair-title" onCancel={(event) => { event.preventDefault(); if (!submitting) onClose(); }}>
+    <div className="dialog-title"><AlertTriangle size={20} aria-hidden="true" /><h2 id="recorded-repair-title">按扫描记录修复慢区</h2><button type="button" className="icon-button" aria-label="关闭修复配置" disabled={submitting} onClick={onClose}><X size={20} /></button></div>
+    <div className="dialog-body">
+      <dl className="confirm-specs">
+        <div><dt>硬盘</dt><dd>{disk.model} · {formatBytes(disk.size)}</dd></div>
+        <div><dt>设备 / 序列号</dt><dd>{disk.path} · {disk.serial}</dd></div>
+        <div><dt>扫描记录</dt><dd>{formatTime(job.finishedAt || job.createdAt)}</dd></div>
+      </dl>
+      <label className="recorded-repair-threshold">修复延迟门槛（毫秒）<input type="number" min="1" max="60000" step="1" value={threshold} disabled={submitting} onChange={(event) => setThreshold(event.target.value)} aria-invalid={!validThreshold} /></label>
+      <p role="status">{validThreshold ? `已记录单次读取 ≥${threshold} ms 的准确范围：${candidates.length} 个 · ${formatBinaryBytes(candidates.reduce((total, cell) => total + cell.maxReadLatency.bytes, 0))}` : "请输入 1～60000 的整数。"}</p>
+      <p className="scan-record-note">每个区域仅处理记录中保留的最慢请求。重新读取当前数据，确认完整、稳定后，备份并原样写回，再读回校验。即使本次读取变快，仍按你选择的历史慢读范围处理。原扫描记录保留。</p>
+      {validThreshold && candidates.length === 0 && <p className="inline-alert warning">当前门槛下没有准确慢读地址。可调整门槛；缺少地址的旧记录需要重新扫描。</p>}
+      <div className="inline-alert danger"><AlertTriangle size={18} aria-hidden="true" /><span>这是实际写盘操作。请先完成独立备份；断电、设备故障或写回失败可能损坏数据。写回校验通过只表示数据一致，速度另行复测。</span></div>
+      <label className="recorded-repair-threshold">输入 REPAIR 确认写回风险<input value={confirmation} disabled={submitting} onChange={(event) => setConfirmation(event.target.value)} autoComplete="off" spellCheck="false" /></label>
+      <label className="confirm-check"><input type="checkbox" disabled={submitting} checked={acknowledged} onChange={(event) => setAcknowledged(event.target.checked)} /><span>我已核对硬盘、完成独立备份，并了解写入风险。</span></label>
+      {error && <p className="inline-alert danger" role="alert">{error}</p>}
+    </div>
+    <div className="dialog-actions"><button type="button" className="button secondary" disabled={submitting} onClick={onClose}>取消</button><button type="button" className="button danger" disabled={submitting || !validThreshold || !candidates.length || !acknowledged || confirmation.trim().toUpperCase() !== "REPAIR"} aria-busy={submitting} onClick={() => onConfirm({type:"scan", device:disk.path, scanMode:job.options?.scanMode || "full", scanRepair:true, scanRepairFrom:job.id, scanRepairAfterMs:Number(threshold), scanRepairAcknowledged:true, expectedDisk:{path:disk.path,serial:disk.serial,model:disk.model,size:disk.size}})}>{submitting ? "正在创建…" : `修复 ${candidates.length} 个范围`}</button></div>
+  </dialog>;
+}
+
+function RecordedRepairPanel({ job, onReturnToScan, returning, returnDisabled, onOpenHistory }) {
+  const [page, setPage] = useState(0);
+  const targets = job.result?.repairTargets || [];
+  const map = job.result?.map || [];
+  const sector = job.disk?.logicalSectorSize || 512;
+  const completed = job.result?.stats?.testedCells || 0;
+  return <section className="recorded-repair-panel" aria-label="按记录修复结果">
+    <div className="recorded-repair-heading">
+      <div className="task-heading"><h2>按记录修复慢区</h2><StatusBadge status={job.status} /></div>
+      <button type="button" className="button secondary" disabled={returnDisabled || returning} aria-busy={returning} data-tooltip={returnDisabled ? "请等待当前任务结束后返回" : "返回本次修复对应的扫描块图"} onClick={() => onReturnToScan(job)}>
+        {returning ? <LoaderCircle size={16} className="spin" aria-hidden="true" /> : <ArrowLeft size={16} aria-hidden="true" />}{returning ? "正在返回…" : "返回扫描结果"}
+      </button>
+    </div>
+    <p>{job.disk?.model} · {job.device}</p>
+    <p role="status">{job.phase} · {completed} / {targets.length} 个范围</p>
+    <progress aria-label="慢区修复进度" max="100" value={job.progress || 0} />
+    <p className="scan-record-note">仅处理选定的历史慢读地址，不代表重新扫描整盘。来源记录：{job.options.scanRepairFrom}</p>
+    {job.message && <p role="status">{job.message}</p>}
+    <ScanRepairSummary job={job} />
+    <div className="recorded-repair-table"><table><caption className="sr-only">历史慢读地址与本次写回结果</caption><thead><tr><th>原区域</th><th>LBA / 大小</th><th>历史耗时</th><th>本次响应</th><th>本次结果</th></tr></thead><tbody>{targets.slice(page*50, (page+1)*50).map((target, offset) => {
+      const cell = map[page*50+offset];
+      const repair = cell?.repair;
+      const outcome = repair?.pending ? "结果未确定" : repair?.failed ? "写回失败" : repair?.stillSlow ? "修复后仍慢" : repair?.verified ? (repair.improved ? "慢速改善 · 写回校验通过" : "写回校验通过") : repair?.skipped ? "已跳过，未写入" : cell?.status === "reading" ? "处理中" : "等待处理";
+      const responseStatus = cell ? scanStatusGroup(cell.status, cell.maxUnitMs, job.result?.latencyBasis) : "pending";
+      const responseMs = cell?.maxReadLatency?.ms;
+      return <tr key={target.cellIndex}><td>{target.cellIndex+1}</td><td>{formatInteger(Math.floor(target.read.offset/sector))}–{formatInteger(Math.floor((target.read.offset+target.read.bytes-1)/sector))}<small>{formatBinaryBytes(target.read.bytes)}</small></td><td>{formatMilliseconds(target.read.ms)}</td><td><span className="recorded-repair-response" data-tooltip={`按本次读取判定：${scanStatusLabel(responseStatus)}`}><i className={`block-${responseStatus}`} aria-hidden="true" />{Number.isFinite(responseMs) ? formatMilliseconds(responseMs) : "—"}</span></td><td>{outcome}</td></tr>;
+    })}</tbody></table></div>
+    {targets.length > 50 && <nav className="dialog-actions" aria-label="修复范围分页"><button type="button" className="button secondary" disabled={page === 0} onClick={() => setPage(page-1)}>上一页</button><span>{page+1} / {Math.ceil(targets.length/50)}</span><button type="button" className="button secondary" disabled={(page+1)*50 >= targets.length} onClick={() => setPage(page+1)}>下一页</button></nav>}
+    <div className="recorded-repair-actions">
+      <a className="button secondary" href={`${API}/jobs/${job.id}/scan-report`} download>导出修复报告</a>
+      <HistoryTrigger onOpen={onOpenHistory} inline />
+    </div>
+  </section>;
+}
+
+const ScanCellButton = React.memo(function ScanCellButton({ cell, columnCount, inspected, pinned, keyboard, revealed, writeMode, latencyBasis }) {
+  const displayStatus = revealed && cell.status !== "reading" ? scanStatusGroup(cell.status, cell.maxUnitMs, latencyBasis) : "pending";
   return (
     <button
       type="button"
@@ -1012,19 +1126,33 @@ const ScanCellButton = React.memo(function ScanCellButton({ cell, columnCount, i
       aria-colindex={(cell.index % columnCount) + 1}
       aria-label={`区域 ${cell.index + 1}，${scanStatusLabel(displayStatus)}`}
       className={`block-cell block-${displayStatus} ${cell.index < columnCount ? "is-top-edge" : ""} ${cell.index % columnCount === 0 ? "is-left-edge" : ""} ${(cell.index + 1) % columnCount === 0 ? "is-right-edge" : ""} ${inspected ? "is-inspected" : ""} ${pinned ? "is-pinned" : ""}`}
-      title={`区域 ${cell.index + 1} · ${formatDiskOffset(cell.start)}–${formatDiskOffset(cell.end)}\n状态：${scanStatusLabel(displayStatus)}${!revealed || cell.maxMs == null ? "" : `\n最大响应：${cell.maxMs} ms\n平均响应：${cell.avgMs} ms\n已读：${formatBytes(cell.bytesRead)}`}${revealed && cell.errorCount ? `\n${writeMode ? "读写/校验错误" : "读取异常"}：${cell.errorCount}` : ""}`}
+      data-tooltip={`区域 ${cell.index + 1} · ${formatDiskOffset(cell.start)}–${formatDiskOffset(cell.end)}\n状态：${scanStatusLabel(displayStatus)}${!revealed || cell.maxMs == null ? "" : `\n最大响应：${cell.maxMs} ms\n平均响应：${cell.avgMs} ms\n已读：${formatBytes(cell.bytesRead)}`}${revealed && cell.errorCount ? `\n${writeMode ? "读写/校验错误" : "读取异常"}：${cell.errorCount}` : ""}`}
     />
   );
 });
 
-function ScanBlockMap({ job, onPlaybackChange, onOpenHistory }) {
-  const writeLatency = ["hdd-write-dual-v2", "solid-write-dual-v2"].includes(job.result?.latencyBasis);
-  const dualLatency = writeLatency || ["hdd-dual-v2", "solid-dual-v2"].includes(job.result?.latencyBasis);
-  const hddLatency = dualLatency || job.result?.latencyBasis === "hdd-relative-v1";
-  const rotationalLatency = ["hdd-dual-v2", "hdd-write-dual-v2"].includes(job.result?.latencyBasis);
+function ScanBlockMap({ job, onPlaybackChange, onOpenHistory, onRepairRecords, repairDisabledReason }) {
+  const latencyBasis = job.result?.latencyBasis || "";
+  const mediaLatency = job.status === "idle" || /-dual-v4$/.test(latencyBasis);
+  const thousandMsLatency = /-dual-v3$/.test(latencyBasis);
+  const writeLatency = /^(hdd|solid)-write-dual-v[234]$/.test(latencyBasis);
+  const dualLatency = /^(hdd|solid)-(write-)?dual-v[234]$/.test(latencyBasis);
+  const hddLatency = dualLatency || latencyBasis === "hdd-relative-v1";
+  const rotationalLatency = /^hdd-(write-)?dual-v[234]$/.test(latencyBasis);
+  const readSlowMs = rotationalLatency ? 50 : 20;
+  const readPoorMs = rotationalLatency ? mediaLatency ? 200 : 150 : 50;
+  const readSevereMs = mediaLatency ? rotationalLatency ? 800 : 500 : thousandMsLatency ? 1000 : rotationalLatency ? 500 : 100;
+  const transferSlowMs = mediaLatency ? readSlowMs : 50;
+  const transferPoorMs = mediaLatency ? readPoorMs : 150;
+  const transferSevereMs = mediaLatency ? readSevereMs : thousandMsLatency ? 1000 : 500;
+  const scanLegend = SCAN_LEGEND.map(([status, label, description]) => [status, label,
+    status === "normal" && mediaLatency ? "未达到一般、较差或严重阈值；较快结果细分为优秀、良好"
+      : status === "slow" ? `折算耗时 ${transferSlowMs}–< ${transferPoorMs} ms`
+      : status === "slower" ? `折算耗时 ${transferPoorMs}–< ${transferSevereMs} ms`
+      : status === "severe" ? `折算耗时 ≥ ${transferSevereMs} ms` : description]);
   const requestThresholds = rotationalLatency
-    ? `HDD 单次读取 ≥50 ms 一般、≥150 ms 较差、≥500 ms 严重${writeLatency ? "" : "；另结合近期同长度读取基准，3 倍一般、10 倍严重"}`
-    : "SSD/NVMe 等非机械设备单次读取 ≥20 ms 一般、≥50 ms 较差、≥100 ms 严重";
+    ? `HDD 单次读取 ≥${readSlowMs} ms 一般、≥${readPoorMs} ms 较差、≥${readSevereMs} ms 严重${writeLatency ? "" : mediaLatency ? "；相对基准波动仅作一般告警，较差与严重按绝对耗时判断" : `；另结合近期同长度读取基准，3 倍一般、10 倍${thousandMsLatency ? "较差；相对倍数不单独判为严重" : "严重"}`}`
+    : `SSD/NVMe 等非机械设备单次读取 ≥20 ms 一般、≥50 ms 较差、≥${readSevereMs} ms 严重`;
   const writeThresholds = rotationalLatency
     ? "HDD 单次写入 ≥100 ms 一般、≥300 ms 较差、≥1000 ms 严重"
     : "SSD/NVMe 等非机械设备单次写入 ≥50 ms 一般、≥150 ms 较差、≥500 ms 严重";
@@ -1032,7 +1160,6 @@ function ScanBlockMap({ job, onPlaybackChange, onOpenHistory }) {
   const map = safeScanMap(rawMap);
   const stats = job.result?.stats || {};
   const outcomeSummary = scanOutcomeSummary(job);
-  const panelRef = useRef(null);
   const mapRef = useRef(null);
   const followPausedUntilRef = useRef(0);
   const detailDialogRef = useRef(null);
@@ -1040,36 +1167,6 @@ function ScanBlockMap({ job, onPlaybackChange, onOpenHistory }) {
   const [pinnedIndex, setPinnedIndex] = useState(null);
   const [detailIndex, setDetailIndex] = useState(null);
   const [summaryView, setSummaryView] = useState(null);
-  const alignPanelRef = useRef(null);
-
-  useLayoutEffect(() => {
-    const panel = panelRef.current;
-    const dashboard = panel?.closest(".dashboard-grid");
-    const options = dashboard?.querySelector(".scan-extra-options");
-    const controls = dashboard?.querySelector(".control-column");
-    if (!panel || !options || !controls) return;
-    const align = () => {
-      if (!window.matchMedia("(min-width: 861px)").matches) {
-        panel.style.removeProperty("--scan-panel-height");
-        return;
-      }
-      const height = Math.max(0, options.getBoundingClientRect().bottom - panel.getBoundingClientRect().top);
-      panel.style.setProperty("--scan-panel-height", `${height}px`);
-    };
-    alignPanelRef.current = align;
-    const observer = new ResizeObserver(align);
-    observer.observe(controls);
-    observer.observe(options);
-    window.addEventListener("resize", align);
-    align();
-    return () => {
-      observer.disconnect();
-      window.removeEventListener("resize", align);
-      alignPanelRef.current = null;
-      panel.style.removeProperty("--scan-panel-height");
-    };
-  }, [job.id, map.length]);
-  useLayoutEffect(() => { alignPanelRef.current?.(); });
   const [revealedPrefix, setRevealedPrefix] = useState(() => terminalScanPrefix(map));
   const revealRef = useRef(null);
   const completedPrefix = terminalScanPrefix(map);
@@ -1170,17 +1267,19 @@ function ScanBlockMap({ job, onPlaybackChange, onOpenHistory }) {
   const bytesPerCell = diskSize / map.length;
   const sampleBytes = job.result?.sampleBytes || (map.length === QUICK_SCAN_CELL_COUNT ? QUICK_SAMPLE_BYTES : LEGACY_QUICK_SAMPLE_BYTES);
   const statusCounts = map.reduce((counts, cell) => {
-    const status = cell.index < visiblePrefix && cell.status !== "reading" ? scanStatusGroup(cell.status, cell.maxUnitMs) : "pending";
+    const status = cell.index < visiblePrefix && cell.status !== "reading" ? scanStatusGroup(cell.status, cell.maxUnitMs, latencyBasis) : "pending";
     counts[status] = (counts[status] || 0) + 1;
     return counts;
   }, {});
   const severeOrErrorCount = (statusCounts.severe || 0) + (statusCounts.error || 0);
+  const abnormalCount = job.type === "write" ? statusCounts.error || 0 : severeOrErrorCount;
+  const badBlockCounts = scanBadBlockSummary(map.slice(0,visiblePrefix),Boolean(job.disk?.rotational));
   const visibleReadBytes = map.slice(0, visiblePrefix).reduce((total, cell) => total + (cell.bytesRead || 0), 0);
   const readBytes = Number.isSafeInteger(stats.bytesRead) && stats.bytesRead >= 0 ? stats.bytesRead : visibleReadBytes;
   const sampledScan = job.result.coverage === "sampled";
   const scanTypeLabel = job.type === "write" ? "深度检测（旧记录）" : sampledScan ? "抽样检测" : "全盘检测";
   const readMethodLabel = job.type === "write" ? "每格写读校验" : sampledScan ? `${job.result.samplingPlan === "stratified-v1" ? "每格分散抽读" : "每格抽读"} ${formatBinaryBytes(sampleBytes)}` : "完整读取每格";
-  const issueCount = outcomeSummary?.issueCount ?? stats.badRanges?.length ?? 0;
+  const issueCount = scanIssueDisplayCount(job);
   const diagnostics = job.result?.diagnostics;
   const hasEvidence = Boolean(diagnostics?.before || diagnostics?.after);
   const evidenceHasWarnings = Boolean(diagnostics?.increased?.length || diagnostics?.before?.warnings?.length || diagnostics?.after?.warnings?.length || ["failed", "unknown"].includes(diagnostics?.selfTest?.state));
@@ -1223,14 +1322,18 @@ function ScanBlockMap({ job, onPlaybackChange, onOpenHistory }) {
     ? inspectedCell.sampleRanges.map((range) => formatInteger(Math.floor(range.start / logicalSectorSize)) + " - " + formatInteger(Math.ceil(range.end / logicalSectorSize)-1)).join("；")
     : hasSampleRange ? formatInteger(sampleStartLba) + " - " + formatInteger(sampleEndLba) : "尚未抽读";
   const badRanges = Array.isArray(stats.badRanges) ? stats.badRanges : [];
-  const cellBadRanges = badRanges.filter((range) => (
+  const cellBadRanges = mergeTimeoutSkipRanges(badRanges.filter((range) => (
     Number.isFinite(range?.offset)
     && Number.isFinite(range?.length)
     && range.length > 0
     && range.offset < inspectedCell.end
     && range.offset + range.length > inspectedCell.start
-  ));
-  const firstBadRangeLba = cellBadRanges.length ? Math.floor(cellBadRanges[0].offset / logicalSectorSize) : null;
+  )));
+  const inspectedSlowProof = scanSlowBadBlock(inspectedCell,Boolean(job.disk?.rotational));
+  const inspectedLocation = scanCellLocationSummary(inspectedCell, cellBadRanges, job.disk?.logicalSectorSize);
+  const inspectedStatus = job.type === "scan" && inspectedCell.status === "error"
+    ? (inspectedCell.unreadableBytes > 0 ? "坏块（不可读）" : inspectedCell.errorCount > 0 ? "读取异常" : "严重卡读")
+    : scanStatusLabel(scanStatusGroup(inspectedCell.status, inspectedCell.maxUnitMs, latencyBasis));
 
   function focusCell(index) {
     const nextIndex = Math.max(0, Math.min(map.length - 1, index));
@@ -1266,7 +1369,7 @@ function ScanBlockMap({ job, onPlaybackChange, onOpenHistory }) {
   }
 
   return (
-    <div ref={panelRef} className="scan-map-panel">
+    <div className="scan-map-panel">
       <div className="scan-map-layout">
         <div className="map-visual">
           <div
@@ -1274,7 +1377,7 @@ function ScanBlockMap({ job, onPlaybackChange, onOpenHistory }) {
             className={`block-map${map.length === QUICK_SCAN_CELL_COUNT ? " dense" : ""}`}
             style={{ "--map-columns": columnCount }}
             role="grid"
-            aria-label={`磁盘扫描块图，已扫描 ${stats.testedCells || 0} 个区域，${stats.errorCells || 0} 个异常区域`}
+            aria-label={`磁盘扫描块图，已扫描 ${visiblePrefix} 个区域，${abnormalCount} 个异常区域`}
             aria-colcount={columnCount}
             aria-rowcount={Math.ceil(map.length / columnCount)}
             onWheel={() => { followPausedUntilRef.current = Date.now() + 5_000; }}
@@ -1307,12 +1410,13 @@ function ScanBlockMap({ job, onPlaybackChange, onOpenHistory }) {
                 keyboard={cell.index === keyboardIndex}
                 revealed={cell.index < visiblePrefix}
                 writeMode={job.type === "write"}
+                latencyBasis={latencyBasis}
               />
             ))}
           </div>
           <div className="block-legend" aria-label="区域检测结果图例">
-            {SCAN_LEGEND.slice(0, 5).map(([status, label, description]) => <span key={status} title={dualLatency ? `传输折算档位：${description}；${requestThresholds}${writeLatency ? `；${writeThresholds}` : ""}。请求不超过 128 KiB，记录主机读写等待时间；传输折算与单次请求分别判断，取较严重结果，读写及校验错误优先。慢响应不等于坏道。` : hddLatency ? `${description}；另结合近期同长度读取的中位基准，3 倍标一般、10 倍标严重，单次等待 500 ms 也标一般。保留最差结果；慢读不等于坏道，异常原因见区域详情。` : job.result?.latencyBasis === "per-mib-v1" || job.status === "idle" ? `${description}。每次传输按 1 MiB 折算，不足 1 MiB 按 1 MiB；取区域内最差值。深度检测计入写入与读回总量。正常仅代表本次检测未见异常。` : "旧记录保留原耗时判定；重新扫描使用按传输量折算的新规则。"}><i className={`block-${status}`} />{label}<b>{statusCounts[status] || 0}</b></span>)}
-            <span className="block-legend-combined" title={`严重 ${statusCounts.severe || 0} · 损坏（${scanErrorLabel}）${statusCounts.error || 0}`}>
+            {scanLegend.slice(0, 5).map(([status, label, description]) => <span key={status} data-tooltip={dualLatency ? `传输折算档位：${description}；${requestThresholds}${writeLatency ? `；${writeThresholds}` : ""}。请求不超过 128 KiB，记录主机读写等待时间；传输折算与单次请求分别判断，取较严重结果，读写及校验错误优先。单次超限保留告警；同范围复测持续超限按慢速坏块统计。` : hddLatency ? `${description}；另结合近期同长度读取的中位基准，3 倍标一般、10 倍标严重，单次等待 500 ms 也标一般。保留最差结果；同范围复测持续超限按慢速坏块统计，异常原因见区域详情。` : job.result?.latencyBasis === "per-mib-v1" || job.status === "idle" ? `${description}。每次传输按 1 MiB 折算，不足 1 MiB 按 1 MiB；取区域内最差值。深度检测计入写入与读回总量。正常仅代表本次检测未见异常。` : "旧记录保留原耗时判定；重新扫描使用按传输量折算的新规则。"}><i className={`block-${status}`} />{label}<b>{statusCounts[status] || 0}</b></span>)}
+            <span className="block-legend-combined" data-tooltip={`红色表示坏块、严重慢读、卡读跳过或${scanErrorLabel}。坏块按正常使用要求判断，保留慢速／不可读原因。${dualLatency ? `${requestThresholds}；传输折算耗时 ≥${transferSevereMs} ms 也判为严重。${writeLatency ? `；${writeThresholds}。` : ""}` : "按扫描记录的严重档位显示。"}\n严重慢读 ${statusCounts.severe || 0} · ${scanErrorLabel} ${statusCounts.error || 0}`}>
               <i className="block-error" aria-hidden="true" />严重<b>{severeOrErrorCount}</b>
             </span>
             <span><i className="block-pending" />未扫描<b>{(statusCounts.pending || 0) + (statusCounts.reading || 0)}</b></span>
@@ -1322,8 +1426,8 @@ function ScanBlockMap({ job, onPlaybackChange, onOpenHistory }) {
           <dl className="scan-map-stats">
             <div><dt>已处理区域</dt><dd>{visiblePrefix} / {map.length}</dd></div>
             <div><dt>{job.type === "write" ? "写入量" : "读取量"}</dt><dd>{formatBytes(readBytes)}</dd></div>
-            <div><dt>慢速区域</dt><dd>{(statusCounts.slow || 0) + (statusCounts.slower || 0) + (statusCounts.severe || 0)}</dd></div>
-            <div><dt>异常区域</dt><dd className={statusCounts.error ? "value-danger" : ""}>{statusCounts.error || 0}</dd></div>
+            <div><dt>慢速区域</dt><dd>{(statusCounts.slow || 0) + (statusCounts.slower || 0) + (job.type === "write" ? statusCounts.severe || 0 : 0)}</dd></div>
+            <div data-tooltip={`坏块（慢速）${badBlockCounts.slow} · 坏块（不可读）${badBlockCounts.unreadable}；同一区域只计一次，数量不等于物理扇区数。其他红色卡顿仍保留告警。`}><dt>{job.type === "write" ? "异常区域" : "坏块区域"}</dt><dd className={(job.type === "write" ? abnormalCount : badBlockCounts.total) ? "value-danger" : ""}>{job.type === "write" ? abnormalCount : badBlockCounts.total}</dd></div>
           </dl>
         </aside>
       </div>
@@ -1333,6 +1437,7 @@ function ScanBlockMap({ job, onPlaybackChange, onOpenHistory }) {
           <button type="button" className="scan-detail-button" aria-haspopup="dialog" onClick={() => setSummaryView("overview")}>扫描详情</button>
           {job.type === "scan" && <button type="button" className={`scan-detail-button${issueCount > 0 ? " value-danger" : ""}`} aria-haspopup="dialog" onClick={() => setSummaryView("issues")}>异常明细{issueCount > 0 ? ` · ${formatInteger(issueCount)}` : ""}</button>}
           <button type="button" className={`scan-detail-button${evidenceHasWarnings ? " value-danger" : ""}`} aria-haspopup="dialog" onClick={() => setSummaryView("evidence")}>SMART／日志{evidenceHasWarnings ? " · 告警" : ""}</button>
+          {job.type === "scan" && job.status === "completed" && <ImmediateTooltip text={repairDisabledReason || "按本次扫描保存的准确慢读地址修复"} focusable={Boolean(repairDisabledReason)}><button type="button" className="scan-detail-button" disabled={Boolean(repairDisabledReason)} aria-haspopup="dialog" onClick={() => onRepairRecords(job)}>修复慢区</button></ImmediateTooltip>}
           <HistoryTrigger onOpen={onOpenHistory} inline />
         </div>
       </div>
@@ -1352,10 +1457,14 @@ function ScanBlockMap({ job, onPlaybackChange, onOpenHistory }) {
             <p>{sampledScan ? "抽样扫描只检查每个区域中的样本；任务完成后，也不代表整盘数据都已读取。" : "全盘扫描逐段读取磁盘；未完成或中断的任务仍有未检测范围。"}覆盖率包含已读出和已确认持续不可读的范围，不包含定位达到限额的待细查范围，与任务进度不同。</p>
           </section>}
           {outcomeSummary && <dl className="scan-outcome-stats">
-            <div title="细分定位后仍未完整读出的范围；范围数不等于物理坏扇区数"><dt>持续不可读</dt><dd className={outcomeSummary.unreadableRanges ? "value-danger" : ""}>{formatInteger(outcomeSummary.unreadableRanges)} 个范围 · {formatBinaryBytes(outcomeSummary.unreadableBytes)}</dd></div>
-            <div title="复读恢复与固件已纠正记录，保留首次告警"><dt>恢复告警</dt><dd>{formatInteger(outcomeSummary.recoveredRanges)} 条</dd></div>
-            <div title="超时、连接、控制器等错误，不能据此判定介质坏区"><dt>设备异常</dt><dd>{formatInteger(outcomeSummary.deviceErrorRanges)} 条</dd></div>
-            {outcomeSummary.unresolvedRanges > 0 && <div><dt>范围未确定</dt><dd>{formatInteger(outcomeSummary.unresolvedRanges)} 条{outcomeSummary.unresolvedBytes > 0 && <> · {formatBinaryBytes(outcomeSummary.unresolvedBytes)} 待细查</>}</dd></div>}
+            <div><dt>坏块（慢速）</dt><dd className={badBlockCounts.slow ? "value-danger" : ""}>{badBlockCounts.slow} 个区域 · 同范围复测持续超限</dd></div>
+            <div><dt>坏块（不可读）</dt><dd className={badBlockCounts.unreadable ? "value-danger" : ""}>{badBlockCounts.unreadable} 个区域 · 重试定位后仍未完整读出</dd></div>
+            <div><dt>异常区域总计</dt><dd>{abnormalCount} 个 · 包含待确认卡顿与设备异常</dd></div>
+            <div data-tooltip="细分定位后仍未完整读出的范围；范围数不等于物理坏扇区数"><dt>持续不可读</dt><dd className={outcomeSummary.unreadableRanges ? "value-danger" : ""}>{formatInteger(outcomeSummary.unreadableRanges)} 个范围 · {formatBinaryBytes(outcomeSummary.unreadableBytes)}</dd></div>
+            <div data-tooltip="复读恢复与固件已纠正记录，保留首次告警"><dt>恢复告警</dt><dd>{formatInteger(outcomeSummary.recoveredRanges)} 条</dd></div>
+            <div data-tooltip="超时、连接、控制器等错误，不能据此判定介质坏区"><dt>设备异常</dt><dd>{formatInteger(outcomeSummary.deviceErrorRanges)} 条</dd></div>
+            {outcomeSummary.skippedBytes > 0 && <div><dt>卡读跳过</dt><dd>{formatBinaryBytes(outcomeSummary.skippedBytes)} · 未完成读取检测</dd></div>}
+            {outcomeSummary.unresolvedBytes > outcomeSummary.skippedBytes && <div><dt>待细查范围</dt><dd>{formatBinaryBytes(outcomeSummary.unresolvedBytes - outcomeSummary.skippedBytes)}</dd></div>}
           </dl>}
         </>}
         {summaryView === "issues" && (issueCount > 0
@@ -1379,12 +1488,12 @@ function ScanBlockMap({ job, onPlaybackChange, onOpenHistory }) {
         }}
       >
         <div className="dialog-title">
-          <span className={`dialog-icon region-dialog-swatch block-${scanStatusGroup(inspectedCell.status, inspectedCell.maxUnitMs)}`} aria-hidden="true" />
+          <span className={`dialog-icon region-dialog-swatch block-${scanStatusGroup(inspectedCell.status, inspectedCell.maxUnitMs, latencyBasis)}`} aria-hidden="true" />
           <div><p className="eyebrow">区域详情</p><h2 id="region-detail-title">区域 {inspectedCell.index + 1}</h2></div>
-          <button className="icon-button" onClick={closeDetail} aria-label="关闭区域详情" title="关闭"><X size={20} /></button>
+          <button className="icon-button" onClick={closeDetail} aria-label="关闭区域详情" data-tooltip="关闭"><X size={20} /></button>
         </div>
         <div className="dialog-body">
-          <div className="region-dialog-status"><span>{scanStatusLabel(scanStatusGroup(inspectedCell.status, inspectedCell.maxUnitMs))}</span><small>磁盘位置 {positionPercent.toFixed(2)}%</small></div>
+          <div className="region-dialog-status"><span>{inspectedStatus}</span><small>磁盘位置 {positionPercent.toFixed(2)}%</small></div>
           <dl className="region-detail-grid">
             <div><dt>容量范围</dt><dd>{formatDiskOffset(inspectedCell.start)} - {formatDiskOffset(inspectedCell.end)}</dd></div>
             <div><dt>LBA 范围</dt><dd>{formatInteger(startLba)} - {formatInteger(endLba)}</dd></div>
@@ -1392,24 +1501,27 @@ function ScanBlockMap({ job, onPlaybackChange, onOpenHistory }) {
             <div><dt>{writeLatency ? "整次写读最大耗时" : dualLatency ? "整次读取最大耗时" : "最大响应"}</dt><dd>{formatMilliseconds(inspectedCell.maxMs)}</dd></div>
             <div><dt>{writeLatency ? "整次写读平均耗时" : dualLatency ? "整次读取平均耗时" : "平均响应"}</dt><dd>{formatMilliseconds(inspectedCell.avgMs)}</dd></div>
             {inspectedCell.maxWriteLatency && <>
-              <div title="不超过 128 KiB 的主机写入请求耗时，包含驱动与调度等待，不代表断电后数据已持久保存"><dt>最慢单次写入</dt><dd>{formatMilliseconds(inspectedCell.maxWriteLatency.ms)} · {formatBytes(inspectedCell.maxWriteLatency.bytes)}</dd></div>
-              <div title={writeThresholds}><dt>最慢写入 LBA</dt><dd>{formatInteger(Math.floor(inspectedCell.maxWriteLatency.offset / logicalSectorSize))}</dd></div>
+              <div data-tooltip="不超过 128 KiB 的主机写入请求耗时，包含驱动与调度等待，不代表断电后数据已持久保存"><dt>最慢单次写入</dt><dd>{formatMilliseconds(inspectedCell.maxWriteLatency.ms)} · {formatBytes(inspectedCell.maxWriteLatency.bytes)}</dd></div>
+              <div data-tooltip={writeThresholds}><dt>最慢写入 LBA</dt><dd>{formatInteger(Math.floor(inspectedCell.maxWriteLatency.offset / logicalSectorSize))}</dd></div>
             </>}
             {inspectedCell.maxReadLatency && <>
-              <div title="不超过 128 KiB 的主机读取请求耗时，包含驱动与调度等待，不是纯固件服务时间"><dt>{job.type === "write" ? "最慢单次读回" : "最慢单次读取"}</dt><dd>{formatMilliseconds(inspectedCell.maxReadLatency.ms)} · {formatBytes(inspectedCell.maxReadLatency.bytes)}</dd></div>
-              <div title={requestThresholds}><dt>{job.type === "write" ? "最慢读回 LBA" : "最慢读取 LBA"}</dt><dd>{formatInteger(Math.floor(inspectedCell.maxReadLatency.offset / logicalSectorSize))}</dd></div>
+              <div data-tooltip="不超过 128 KiB 的主机读取请求耗时，包含驱动与调度等待，不是纯固件服务时间"><dt>{job.type === "write" ? "最慢单次读回" : "最慢单次读取"}</dt><dd>{formatMilliseconds(inspectedCell.maxReadLatency.ms)} · {formatBytes(inspectedCell.maxReadLatency.bytes)}</dd></div>
+              <div data-tooltip={requestThresholds}><dt>{job.type === "write" ? "最慢读回 LBA" : "最慢读取 LBA"}</dt><dd>{formatInteger(Math.floor(inspectedCell.maxReadLatency.offset / logicalSectorSize))}</dd></div>
             </>}
-            {inspectedCell.latencyWarning && <div><dt>响应异常依据</dt><dd>{inspectedCell.latencyWarning === "stall" ? "单次读取等待达到 500 ms" : `达到近期同长度读取基准的 ${Number(inspectedCell.maxLatencyRatio).toFixed(1)} 倍`}（慢读不等于坏道）</dd></div>}
-            {Number.isFinite(inspectedCell.maxUnitMs) && <div title="每次传输按 1 MiB 折算，不足 1 MiB 按 1 MiB，取区域内最差值；原始响应时间保持不变"><dt>{dualLatency ? "传输折算耗时" : "判色折算耗时"}</dt><dd>{formatMilliseconds(inspectedCell.maxUnitMs)}</dd></div>}
+            {inspectedCell.latencyWarning && <div><dt>响应异常依据</dt><dd>{inspectedCell.latencyWarning === "stall" ? "单次读取等待达到 500 ms" : `达到近期同长度读取基准的 ${Number(inspectedCell.maxLatencyRatio).toFixed(1)} 倍`}（持续性见同范围复测）</dd></div>}
+            {Number.isFinite(inspectedCell.maxUnitMs) && <div data-tooltip="每次传输按 1 MiB 折算，不足 1 MiB 按 1 MiB，取区域内最差值；原始响应时间保持不变"><dt>{dualLatency ? "传输折算耗时" : "判色折算耗时"}</dt><dd>{formatMilliseconds(inspectedCell.maxUnitMs)}</dd></div>}
             <div><dt>{job.type === "write" ? "实际写入" : "实际读取"}</dt><dd>{formatBytes(inspectedCell.bytesRead)}</dd></div>
             <div><dt>{job.result.coverage === "sampled" ? "抽读 LBA" : job.type === "write" ? "写读轮次" : "读取次数"}</dt><dd>{job.result.coverage === "sampled" ? sampleLbaLabel : formatInteger(inspectedCell.reads || 0)}</dd></div>
-            <div><dt>{job.type === "write" ? "读写/校验错误" : "读取异常记录"}</dt><dd className={inspectedCell.errorCount ? "value-danger" : ""}>{inspectedCell.errorCount ? `${inspectedCell.errorCount}${firstBadRangeLba == null ? "" : ` · LBA ${formatInteger(firstBadRangeLba)}`}` : "0"}</dd></div>
+            <div><dt>{job.type === "write" ? "读写/校验错误" : "读取异常记录"}</dt><dd className={inspectedCell.errorCount ? "value-danger" : ""}>{inspectedCell.errorCount || 0}</dd></div>
             {outcomeSummary && <>
-              <div><dt>读取结论</dt><dd>{{ readable: "完整读出", recovered: "复读恢复，保留告警", unreadable: "存在持续不可读范围", device_error: "设备异常，不能判定介质坏区", unresolved: "异常范围未确定", partial: "部分读取，尚未完成" }[inspectedCell.readOutcome] || "尚未完成"}</dd></div>
+              <div><dt>坏扇区定位</dt><dd>{inspectedLocation}</dd></div>
+              <div><dt>读取结论</dt><dd>{scanBadBlockKind(inspectedCell,Boolean(job.disk?.rotational)) === "unreadable" ? "坏块（不可读）" : scanBadBlockKind(inspectedCell,Boolean(job.disk?.rotational)) === "slow" ? "坏块（慢速）· 已不满足正常使用要求" : inspectedCell.skippedBytes > 0 ? "严重卡读，已跳过剩余范围" : inspectedCell.readOutcome === "readable" && scanStatusGroup(inspectedCell.status, inspectedCell.maxUnitMs, latencyBasis) === "severe" ? "严重慢读，持续性尚待确认" : ({ readable: "完整读出", recovered: "复读恢复，保留告警", device_error: "设备异常，需核查连接和控制器", unresolved: "异常范围未确定", partial: "部分读取，尚未完成" }[inspectedCell.readOutcome] || "尚未完成")}</dd></div>
               <div><dt>已判定覆盖</dt><dd>{formatBinaryBytes(inspectedCell.coveredBytes || 0)}{job.result.coverage === "full" && (inspectedCell.coveredBytes || 0) < inspectedCell.end - inspectedCell.start ? " · 未覆盖完整区域" : ""}</dd></div>
             </>}
             {inspectedCell.load?.backgroundActivity && <div><dt>扫描时磁盘活动</dt><dd>检测到并发磁盘活动，首次慢响应保留；不能仅凭耗时判定介质异常。</dd></div>}
-            {inspectedCell.unresolvedBytes > 0 && <div><dt>待细查范围</dt><dd>{formatBinaryBytes(inspectedCell.unresolvedBytes)} · 达到定位限额，可使用深入定位重新检测</dd></div>}
+            {inspectedCell.skippedBytes > 0 && <div><dt>卡读跳过</dt><dd>{formatBinaryBytes(inspectedCell.skippedBytes)} · 未完成读取检测</dd></div>}
+            {inspectedCell.unresolvedBytes > (inspectedCell.skippedBytes || 0) && <div><dt>待细查范围</dt><dd>{formatBinaryBytes(inspectedCell.unresolvedBytes - (inspectedCell.skippedBytes || 0))} · 达到定位限额，可使用深入定位重新检测</dd></div>}
+            {inspectedSlowProof && <div><dt>慢速坏块依据</dt><dd>LBA {formatInteger(Math.floor(inspectedSlowProof.offset/logicalSectorSize))} · 相同 {formatBinaryBytes(inspectedSlowProof.bytes)} 请求 · {formatMilliseconds(inspectedSlowProof.firstMs)} / {formatMilliseconds(inspectedSlowProof.repeatMs)}；复测期间未检测到并发负载</dd></div>}
             {inspectedCell.recheck && <>
               <div><dt>慢速只读复测</dt><dd>{{ not_reproduced: "未触发复测慢速阈值（保留首次响应）", slow: "复测仍然偏慢", read_issue: "复测出现读取异常" }[inspectedCell.recheck.outcome] || "已复测"}</dd></div>
               {inspectedCell.recheck.load?.backgroundActivity && <div><dt>复测环境</dt><dd>复测期间仍有并发磁盘活动，耗时结论需空闲时确认</dd></div>}
@@ -1417,24 +1529,28 @@ function ScanBlockMap({ job, onPlaybackChange, onOpenHistory }) {
               {inspectedCell.recheck.maxReadLatency && <div><dt>复测最慢单次读取</dt><dd>{formatMilliseconds(inspectedCell.recheck.maxReadLatency.ms)} · {formatBytes(inspectedCell.recheck.maxReadLatency.bytes)}</dd></div>}
               <div><dt>额外复测读取量</dt><dd>{formatBytes(inspectedCell.recheck.bytesRead)} · {inspectedCell.recheck.reads} 次</dd></div>
             </>}
-            {inspectedCell.repair && <div><dt>慢扇区写回</dt><dd>{inspectedCell.repair.verified + inspectedCell.repair.stillSlow} 个数据校验通过 · {inspectedCell.repair.stillSlow} 个仍慢 · {inspectedCell.repair.skipped} 个跳过 · {inspectedCell.repair.failed} 个失败 · {ACTIVE.has(job.status) ? "处理中" : "结果未确定"} {inspectedCell.repair.pending} 个</dd></div>}
+            {inspectedCell.repair && <div><dt>慢扇区写回</dt><dd>{inspectedCell.repair.verified + inspectedCell.repair.stillSlow} 个写回校验通过 · {inspectedCell.repair.improved || 0} 个慢速改善 · {inspectedCell.repair.stillSlow} 个修复后仍慢 · {inspectedCell.repair.skipped} 个跳过 · {inspectedCell.repair.failed} 个失败 · {ACTIVE.has(job.status) ? "处理中" : "结果未确定"} {inspectedCell.repair.pending} 个</dd></div>}
             {cellBadRanges.length > 0 && (
-              <div>
+              <div className="region-issue-details">
                 <dt>异常明细</dt>
                 <dd>
                   {cellBadRanges.slice(0, 20).map((range, index) => {
-                    const start = Math.floor(range.offset / logicalSectorSize);
-                    const end = Math.max(start, Math.ceil((range.offset + range.length) / logicalSectorSize) - 1);
-                    const recovery = range.code === "RECOVERED_ERROR" && range.recovered === true ? " · 固件已纠正（保留告警）" : range.recovered === true ? " · 复读恢复（保留首次异常）"
+                    const location = scanRangeLocation(range, job.disk?.logicalSectorSize);
+                    const address = location.startLba == null
+                      ? `字节 ${formatInteger(range.offset)}–${formatInteger(range.offset + range.length - 1)}`
+                      : `LBA ${formatInteger(location.startLba)}–${formatInteger(location.endLba)}`;
+                    const skippedLocation = range.skippedRange ? scanRangeLocation(range.skippedRange, job.disk?.logicalSectorSize) : null;
+                    const skippedAddress = skippedLocation ? (skippedLocation.startLba == null ? `字节 ${formatInteger(range.skippedRange.offset)}–${formatInteger(range.skippedRange.offset + range.skippedRange.length - 1)}` : `LBA ${formatInteger(skippedLocation.startLba)}–${formatInteger(skippedLocation.endLba)}`) : "";
+                    const recovery = range.skippedRange ? "" : range.code === "RECOVERED_ERROR" && range.recovered === true ? " · 固件已纠正（保留告警）" : range.recovered === true ? " · 复读恢复（保留首次异常）"
                       : range.recovered === false ? " · 复读仍未完全读取" : "";
-                    const labels = { MEDIUM_ERROR: "设备报告介质错误", RECOVERED_ERROR: "固件报告已纠正错误", TRANSPORT_ERROR: "连接或传输错误", TIMEOUT: "读取超时", HARDWARE_ERROR: "设备硬件错误", CONTROLLER_ERROR: "控制器错误", NOT_READY: "设备未就绪", UNIT_ATTENTION: "设备状态变化", COMMAND_ABORTED: "读取命令中止", COMMAND_ERROR: "读取命令失败", ILLEGAL_REQUEST: "设备拒绝读取命令", DEVICE_ERROR: "设备报告错误", EIO: "I/O 读取错误（原因未细分）", READ_RETRY: "首次读取异常", SHORT_READ: "未完整读取" };
+                    const labels = { SLOW_READ_LIMIT: "卡读跳过，未完成定位", LOCALIZATION_LIMIT: "定位达到限额", MEDIUM_ERROR: "设备报告介质错误", RECOVERED_ERROR: "固件报告已纠正错误", TRANSPORT_ERROR: "连接或传输错误", TIMEOUT: "读取超时", HARDWARE_ERROR: "设备硬件错误", CONTROLLER_ERROR: "控制器错误", NOT_READY: "设备未就绪", UNIT_ATTENTION: "设备状态变化", COMMAND_ABORTED: "读取命令中止", COMMAND_ERROR: "读取命令失败", ILLEGAL_REQUEST: "设备拒绝读取命令", DEVICE_ERROR: "设备报告错误", EIO: "I/O 读取错误（原因未细分）", READ_RETRY: "首次读取异常", SHORT_READ: "未完整读取" };
                     const evidence = range.evidence;
                     labels.WRITE_ERROR = "写入失败";
                     labels.READ_AFTER_WRITE_ERROR = "写入后读回失败";
                     labels.WRITE_VERIFY_MISMATCH = "读回数据与写入内容不一致";
                     labels.DEFERRED_ERROR = "设备延迟报告错误（不能归因于当前扇区）";
                     Object.assign(labels, { DATA_INTEGRITY_ERROR: "NVMe 数据完整性错误", UNWRITTEN_LBA: "未分配或未写入区域（不等于介质坏块）", ACCESS_DENIED: "设备拒绝访问" });
-                    return <React.Fragment key={`${range.offset}-${range.length}-${index}`}>{index > 0 && <br />}LBA {formatInteger(start)}–{formatInteger(end)} · {labels[range.code] || range.code || labels.EIO} · {formatBinaryBytes(range.length)}{recovery}{evidence?.protocol === "nvme" ? ` · NSID ${evidence.nsid}${evidence.nvmeStatus > 0 ? ` / SCT ${evidence.statusCodeType ?? 0} / SC 0x${Number(evidence.statusCode ?? 0).toString(16)}${evidence.doNotRetry ? " / DNR" : ""}` : " / 未取得设备完成状态"}` : evidence && ` · sense ${[evidence.senseKey, evidence.asc, evidence.ascq].map((value) => Number(value).toString(16).padStart(2, "0")).join("/")}`}{Number.isSafeInteger(evidence?.lba) && ` · 设备返回 LBA ${formatInteger(evidence.lba)}（定位线索）`}</React.Fragment>;
+                    return <React.Fragment key={`${range.offset}-${range.length}-${index}`}>{index > 0 && <br />}{address} · {range.skippedRange ? "读取超时，已跳过" : labels[range.code] || range.code || labels.EIO} · {formatBinaryBytes(range.length)} · {location.label}{skippedAddress && ` · 跳过 ${skippedAddress}（${formatBinaryBytes(range.skippedRange.length)}）`}{recovery}{evidence?.protocol === "nvme" ? ` · NSID ${evidence.nsid}${evidence.nvmeStatus > 0 ? ` / SCT ${evidence.statusCodeType ?? 0} / SC 0x${Number(evidence.statusCode ?? 0).toString(16)}${evidence.doNotRetry ? " / DNR" : ""}` : " / 未取得设备完成状态"}` : evidence && ` · sense ${[evidence.senseKey, evidence.asc, evidence.ascq].map((value) => Number(value).toString(16).padStart(2, "0")).join("/")}`}{Number.isSafeInteger(evidence?.lba) && ` · 设备返回 LBA ${formatInteger(evidence.lba)}（定位线索）`}</React.Fragment>;
                   })}
                   {(cellBadRanges.length > 20 || stats.issuesTruncated) && <p className="scan-record-note">此处展示部分摘要，完整地址请打开异常明细或导出扫描报告。</p>}
                 </dd>
@@ -1442,7 +1558,7 @@ function ScanBlockMap({ job, onPlaybackChange, onOpenHistory }) {
             )}
           </dl>
           {inspectedCell.errorCount > 0 && (
-            <div className="inline-alert danger region-dialog-alert"><AlertTriangle size={17} /><span>{cellBadRanges.length ? `摘要包含 ${cellBadRanges.length} 条异常范围，首个位置约为 LBA ${formatInteger(firstBadRangeLba)}。异常不代表整个区域不可读。` : outcomeSummary ? "该区域发生过读取异常，完整地址请查看异常明细或导出扫描报告。" : "旧记录未保留该区域的完整异常地址，不能据此确定坏区范围。"}</span></div>
+            <div className="inline-alert danger region-dialog-alert"><AlertTriangle size={17} /><span>{cellBadRanges.length ? "异常地址及定位精度见上方明细；卡读跳过或待定位范围不代表已确认坏扇区。" : outcomeSummary ? "该区域发生过读取异常，完整地址请查看异常明细或导出扫描报告。" : "旧记录未保留该区域的完整异常地址，不能据此确定坏区范围。"}</span></div>
           )}
         </div>
         <div className="dialog-actions"><button className="button secondary" onClick={closeDetail}>关闭</button></div>
@@ -1495,7 +1611,6 @@ function benchmarkDetail(benchmark, cached) {
 }
 
 function SpeedBenchmark({ job, config, onStart, startDisabled }) {
-  const measured = Array.isArray(job.result?.benchmarks) ? job.result.benchmarks : [];
   const completedResultValid = job.status !== "completed" || isCompleteSpeedResult(job);
   const finished = !ACTIVE.has(job.status) && job.status !== "idle";
   const hasModernProfile = job.options?.speedProfile === true || typeof job.options?.speedIOEngine === "string";
@@ -1509,13 +1624,8 @@ function SpeedBenchmark({ job, config, onStart, startDisabled }) {
       };
   const speedRows = hasModernProfile || job.status === "idle" ? configuredSpeedRows(matrixConfig) : LEGACY_SPEED_ROWS;
   const cached = job.options?.speedDirectIO === false;
-  const findBenchmark = (row, operation) => measured.find((benchmark) => (
-    benchmark.operation === operation
-      && benchmark.pattern === row.pattern
-      && benchmark.blockSize === row.blockSize
-      && (benchmark.queueDepth ?? 1) === row.queueDepth
-      && (benchmark.threads ?? 1) === row.threads
-  )) || { operation, ...row, averageMBps: null, iops: null, samples: [] };
+  const cells = speedBenchmarkCells(job, speedRows);
+  const testingCell = cells.find((cell) => cell.active);
   const startBenchmark = (row) => onStart({
     type: "speed",
     speedRuns: config.speedRuns,
@@ -1537,6 +1647,10 @@ function SpeedBenchmark({ job, config, onStart, startDisabled }) {
 
   return (
     <div className="benchmark-panel">
+      <span className="sr-only" role="status">{testingCell ? `正在测试 ${testingCell.row.title} ${SPEED_COLUMNS.find((column) => column.operation === testingCell.operation).label}` : ""}</span>
+      {job.status === "failed" && (
+        <div className="inline-alert danger benchmark-failure" role="alert"><AlertTriangle size={18} aria-hidden="true" /><span>测速失败：{job.message || "任务异常结束，请重新测速。"}</span></div>
+      )}
       {job.status === "completed" && !completedResultValid && (
         <div className="inline-alert warning" role="alert"><AlertTriangle size={18} /><span>历史测速明细格式不正确，无法显示部分或全部结果。</span></div>
       )}
@@ -1549,7 +1663,7 @@ function SpeedBenchmark({ job, config, onStart, startDisabled }) {
             </div>
           ))}
         </div>
-        {speedRows.map((row) => {
+        {speedRows.map((row, rowIndex) => {
           return (
             <div className="benchmark-matrix-row" role="row" key={row.key}>
               <div className="benchmark-test-cell" role="rowheader">
@@ -1559,22 +1673,20 @@ function SpeedBenchmark({ job, config, onStart, startDisabled }) {
                   onClick={() => startBenchmark(row)}
                   disabled={startDisabled}
                   aria-label={`单独运行${row.title}测速`}
-                  title={`单独运行 ${row.title}`}
+                  data-tooltip={`单独运行 ${row.title}`}
                 >
                   <strong>{row.code}</strong>
                   <small>{row.subcode}</small>
                 </button>
               </div>
-              {SPEED_COLUMNS.map(({ operation }) => {
-                  const benchmark = findBenchmark(row, operation);
+              {SPEED_COLUMNS.map(({ operation }, columnIndex) => {
+                  const { benchmark, active: testing, skipped: combinationSkipped } = cells[rowIndex * SPEED_COLUMNS.length + columnIndex];
                   const write = operation === "write";
-                  const averageMBps = benchmark.averageMBps;
+                  const averageMBps = benchmark?.averageMBps;
                   const hasValue = Number.isFinite(averageMBps);
-                  const combinationSkipped = (Boolean(job.options?.speedPattern) && job.options.speedPattern !== row.pattern)
-                    || (typeof job.options?.speedOperation === "string" && job.options.speedOperation !== operation)
-                    || (typeof job.options?.speedProfileRow === "string" && job.options.speedProfileRow !== row.profileRow);
                   const status = hasValue
                     ? "已完成"
+                    : testing ? "正在测试"
                     : (job.status === "idle" ? "尚未开始" : (finished ? (combinationSkipped ? "未执行" : "未完成") : "等待测试"));
                   const detail = hasValue ? benchmarkDetail(benchmark, cached) : status;
                   const formattedValue = hasValue
@@ -1585,13 +1697,14 @@ function SpeedBenchmark({ job, config, onStart, startDisabled }) {
                     : status;
                   return (
                     <div
-                      className={`benchmark-result-cell ${operation}${hasValue ? "" : " pending"}`}
+                      className={`benchmark-result-cell ${operation}${hasValue ? "" : " pending"}${testing ? " testing" : ""}`}
                       role="cell"
                       key={operation}
+                      aria-busy={testing || undefined}
                       aria-label={`${row.title}${operation === "read" ? "读取" : (write ? "写入" : "混合")}，${accessibleValue}`}
                     >
-                      <strong className="benchmark-result-number">{formattedValue}</strong>
-                      <small className="benchmark-result-detail" title={detail}>{detail || status}</small>
+                      <strong className="benchmark-result-number">{testing ? <LoaderCircle className="spin benchmark-running-icon" aria-hidden="true" /> : formattedValue}</strong>
+                      <small className="benchmark-result-detail" data-tooltip={detail}>{detail || status}</small>
                     </div>
                   );
                 })}
@@ -1603,24 +1716,29 @@ function SpeedBenchmark({ job, config, onStart, startDisabled }) {
   );
 }
 
-function ActiveTask({ job, contextDisk, detailState, onReloadDetail, speedConfig, onStartSpeed, speedStartDisabled, onPlaybackChange, onOpenHistory }) {
+function ActiveTask({ job, contextDisk, detailState, onReloadDetail, speedConfig, onStartSpeed, speedStartDisabled, onPlaybackChange, onOpenHistory, onRepairRecords, repairDisabledReason, onReturnToScan, returningRepairId, returnDisabled }) {
   if (!job) return null;
   const idle = job.status === "idle";
   const contextMismatch = job.type !== "speed" && !idle && contextDisk && !jobBelongsToDisk(job, contextDisk);
-  const scanResultComplete = (job.type !== "scan" && job.type !== "write") || job.status !== "completed" || isCompleteScanResult(job);
+  const recordedRepair = Boolean(job.options?.scanRepairFrom);
+  const badBlocks = scanBadBlockSummary(job.result?.map,Boolean(job.disk?.rotational));
+  const scanResultComplete = (job.type !== "scan" && job.type !== "write") || job.status !== "completed" || (recordedRepair ? isCompleteRecordedRepairResult(job) : isCompleteScanResult(job));
   const speedResultComplete = job.type !== "speed" || job.status !== "completed" || isCompleteSpeedResult(job);
   const scanHasErrors = (job.type === "scan" || job.type === "write")
     && job.status === "completed"
     && scanResultComplete
-    && Number(job.result?.stats?.errorCells || 0) > 0;
+    && (job.type === "scan" ? scanAbnormalCellCount(job.result?.map) : Number(job.result?.stats?.errorCells || 0)) > 0;
   const resultIncomplete = job.status === "completed" && job.result && (!scanResultComplete || !speedResultComplete);
   return (
-    <section className="active-task" aria-label={job.type === "speed" ? "磁盘测速" : (job.type === "write" ? "深度检测" : "磁盘扫描")} title={!idle ? `${job.disk?.model || "未知型号"} · ${job.device || "未知设备"}` : undefined}>
+    <section className="active-task" aria-label={job.type === "speed" ? "磁盘测速" : (job.type === "write" ? "深度检测" : "磁盘扫描")} data-tooltip={!idle ? `${job.disk?.model || "未知型号"} · ${job.device || "未知设备"}` : undefined}>
       {scanHasErrors && (
         <div className="completion-result has-errors task-result-alert" role="alert">
           <AlertTriangle size={20} />
-          <span>{job.type === "write" ? `发现 ${job.result.stats.errorCells} 个写入或校验异常区域` : `发现 ${job.result.stats.errorCells} 个读取异常区域`}</span>
+          <span>{job.type === "write" ? `发现 ${job.result.stats.errorCells} 个写入或校验异常区域` : badBlocks.total ? `发现 ${badBlocks.total} 个坏块区域（慢速 ${badBlocks.slow} · 不可读 ${badBlocks.unreadable}），已不满足正常使用要求，建议更换硬盘` : `发现 ${scanAbnormalCellCount(job.result.map)} 个异常区域，严重慢读或设备异常需进一步确认`}</span>
         </div>
+      )}
+      {job.type === "scan" && ACTIVE.has(job.status) && job.phase === "读取超时，等待设备请求结束" && (
+        <div className="inline-alert danger" role="alert"><AlertTriangle size={18} /><span>硬盘读取超时，正在等待设备返回；当前请求结束前无法继续读取后面的区域。</span></div>
       )}
       {detailState && ["loading", "retrying"].includes(detailState.status) && (
         <div className="inline-alert warning" role="status">
@@ -1637,7 +1755,7 @@ function ActiveTask({ job, contextDisk, detailState, onReloadDetail, speedConfig
       )}
       {contextMismatch && <div className="inline-alert warning" role="status"><AlertTriangle size={18} /><span>当前显示的是 {job.disk?.model || "历史磁盘"}（{job.device}）的任务结果，不属于上方所选磁盘。</span></div>}
       {job.persistenceWarning && <div className="inline-alert warning" role="alert"><AlertTriangle size={18} /><span>{job.persistenceWarning}</span></div>}
-      {(job.type === "scan" || job.type === "write") && <ScanBlockMap key={job.id} job={job} onPlaybackChange={onPlaybackChange} onOpenHistory={onOpenHistory} />}
+      {recordedRepair ? <RecordedRepairPanel key={job.id} job={job} onReturnToScan={onReturnToScan} returning={returningRepairId === job.id} returnDisabled={returnDisabled} onOpenHistory={onOpenHistory} /> : (job.type === "scan" || job.type === "write") && <ScanBlockMap key={job.id} job={job} onPlaybackChange={onPlaybackChange} onOpenHistory={onOpenHistory} onRepairRecords={onRepairRecords} repairDisabledReason={repairDisabledReason} />}
       {job.type === "speed" && (
         <SpeedBenchmark
           job={job}
@@ -1652,7 +1770,7 @@ function ActiveTask({ job, contextDisk, detailState, onReloadDetail, speedConfig
           <span>结果数据不完整，不能据此判断磁盘状态；请刷新详情或重新运行测试。</span>
         </div>
       </div>}
-      {(job.type === "speed" || !safeScanMap(job.result?.map).length) && <HistoryTrigger onOpen={onOpenHistory} />}
+      {!recordedRepair && (job.type === "speed" || !safeScanMap(job.result?.map).length) && <HistoryTrigger onOpen={onOpenHistory} />}
     </section>
   );
 }
@@ -1730,7 +1848,7 @@ function HistoryDialog({ mode, selectedId, onSelect, onDelete, onClose, selectio
                     disabled={selectionLocked}
                   >
                     <span className="history-record-header">
-                      <strong>{job.type === "write" ? "深度检测（旧记录）" : (job.type === "scan" ? (job.options?.scanMode === "full" ? "完整扫描" : "快速扫描") : "速度测试")}</strong>
+                      <strong>{job.options?.scanRepairFrom ? "按记录修复慢区" : job.type === "write" ? "深度检测（旧记录）" : (job.type === "scan" ? (job.options?.scanMode === "full" ? "完整扫描" : "快速扫描") : "速度测试")}</strong>
                       <StatusBadge status={job.status} />
                     </span>
                     <span className="history-record-disk">
@@ -1746,7 +1864,7 @@ function HistoryDialog({ mode, selectedId, onSelect, onDelete, onClose, selectio
                     onClick={() => { onClose(); onDelete(job); }}
                     disabled={ACTIVE.has(job.status)}
                     aria-label={`删除${job.device || "此任务"}的历史记录`}
-                    title={ACTIVE.has(job.status) ? "运行中的任务不能删除" : "删除历史记录"}
+                    data-tooltip={ACTIVE.has(job.status) ? "运行中的任务不能删除" : "删除历史记录"}
                   >
                     <Trash2 size={15} aria-hidden="true" />
                   </button>
@@ -1785,7 +1903,7 @@ function DeleteHistoryDialog({ job, deleting, onClose, onConfirm }) {
       <div className="dialog-title">
         <span className="dialog-icon dialog-icon-danger"><Trash2 size={21} aria-hidden="true" /></span>
         <div><p className="eyebrow">历史记录</p><h2 id="delete-history-title">删除这条记录？</h2></div>
-        <button className="icon-button" type="button" onClick={onClose} disabled={deleting} aria-label="关闭" title="关闭"><X size={20} /></button>
+        <button className="icon-button" type="button" onClick={onClose} disabled={deleting} aria-label="关闭" data-tooltip="关闭"><X size={20} /></button>
       </div>
       <div className="dialog-body delete-history-body">
         <p>将删除 {job.device || "所选设备"} 的这条检测记录，删除后无法恢复。磁盘中的数据不会受到影响。</p>
@@ -1846,7 +1964,7 @@ function ConfirmDialog({ request, onClose, onConfirm, submitting }) {
       <div className="dialog-title">
         <span className={`dialog-icon${rawWillWrite || repair ? " dialog-icon-danger" : ""}`}><AlertTriangle size={22} /></span>
         <div><p className="eyebrow">{rawWillWrite ? "破坏性操作" : (repair ? "包含磁盘写入" : "确认任务")}</p><h2 id="confirm-dialog-title">{repair ? `${taskLabel}与慢扇区修复` : taskLabel}</h2></div>
-        <button className="icon-button" onClick={onClose} disabled={submitting} aria-label="关闭" title="关闭"><X size={20} /></button>
+        <button className="icon-button" onClick={onClose} disabled={submitting} aria-label="关闭" data-tooltip="关闭"><X size={20} /></button>
       </div>
       <div className="dialog-body">
         {!speed && !repair && disk.isSystem && <div className="inline-alert warning"><AlertTriangle size={19} /><span>所选设备包含系统挂载点。任务不会写盘，但会显著增加 I/O 负载。</span></div>}
@@ -1993,6 +2111,8 @@ function App() {
   const [selectedSpeedKey, setSelectedSpeedKey] = useState("");
   const [jobs, setJobs] = useState([]);
   const [selectedJob, setSelectedJob] = useState(null);
+  const [recordedRepairRequest, setRecordedRepairRequest] = useState(null);
+  const [returningRepairId, setReturningRepairId] = useState("");
   const [health, setHealth] = useState(null);
   const [mode, setMode] = useState("scan");
   const [scanMode, setScanMode] = useState("quick");
@@ -2067,9 +2187,11 @@ function App() {
   const createPendingRef = useRef(false);
   const cancelPendingRef = useRef(new Set());
   const selectedDiskRef = useRef(null);
+  const initialSelectionPendingRef = useRef(true);
   const selectedStorageRef = useRef(null);
   const trimDefaultTargetRef = useRef("");
   const resumeLookupRef = useRef(null);
+  const returnToScanRef = useRef(null);
 
   const selectedDisk = useMemo(() => disks.find((disk) => disk.path === selectedPath) || disks[0] || null, [disks, selectedPath]);
   const selectedStorageSpace = useMemo(() => (
@@ -2108,7 +2230,7 @@ function App() {
     disk: selectedDisk,
     options: { scanMode, scanExactSectors },
     result: {
-      latencyBasis: selectedDisk.rotational ? "hdd-dual-v2" : "solid-dual-v2",
+      latencyBasis: selectedDisk.rotational ? "hdd-dual-v4" : "solid-dual-v4",
       coverage: scanMode === "full" ? "full" : "sampled",
       ...(scanMode === "quick" ? { sampleBytes: QUICK_SAMPLE_BYTES } : {}),
       map: createPendingMap(selectedDisk.size, scanMode === "quick" ? QUICK_SCAN_CELL_COUNT : SCAN_CELL_COUNT),
@@ -2145,6 +2267,11 @@ function App() {
     mode
   });
   const shownJobDisk = useMemo(() => findCurrentDiskForJob(disks, shownJob), [disks, shownJob]);
+  useEffect(() => () => returnToScanRef.current?.abort(), [mode, shownJob?.id]);
+  const recordedRepairBlockedReason = health?.capabilities?.recordedRepair !== true ? "当前后台不支持按记录修复，请更新并重启应用"
+    : controlsLocked ? "请先等待当前任务结束"
+    : !jobBelongsToDisk(shownJob, selectedDisk) ? "扫描记录与当前所选硬盘不匹配"
+    : scanRepairDiskBlockedReason(selectedDisk) || (!recordedRepairCandidates(shownJob).length ? "记录中没有可修复的准确慢读地址，请重新扫描定位" : "");
 
   useEffect(() => {
     selectedDiskRef.current = selectedDisk;
@@ -2249,7 +2376,7 @@ function App() {
 
     const request = Promise.allSettled([
       api("/disks", { signal: controller.signal }).then(readStorageInventory),
-      api(currentJobListPath(jobsRef.current), { signal: controller.signal }).then(readJobList),
+      api("/jobs?summary=1", { signal: controller.signal }).then(readJobList),
       api("/health", { signal: controller.signal }).then(readHealth)
     ]).then(([diskResult, jobResult, healthResult]) => {
       if (!mountedRef.current || controller.signal.aborted || generation !== refreshGenerationRef.current) return;
@@ -2261,7 +2388,18 @@ function App() {
         const continuedDisk = previousDisk
           ? findCurrentDiskForJob(nextDisks, { device: previousDisk.path, disk: previousDisk })
           : null;
-        const nextSelectedDisk = continuedDisk || nextDisks[0] || null;
+        let restoredJob = null;
+        if (initialSelectionPendingRef.current && jobResult.status === "fulfilled" && jobsVersion === jobsVersionRef.current) {
+          initialSelectionPendingRef.current = false;
+          restoredJob = findLatestScanJob(jobResult.value, nextDisks);
+          if (restoredJob) {
+            setSelectedJob(restoredJob);
+            setScanMode(restoredJob.type === "write" || restoredJob.options?.scanMode === "full" ? "full" : "quick");
+            setScanExactSectors(restoredJob.options?.scanExactSectors !== false);
+            setScanDeepLocate(restoredJob.options?.scanDeepLocate === true);
+          }
+        }
+        const nextSelectedDisk = findCurrentDiskForJob(nextDisks, restoredJob) || continuedDisk || nextDisks[0] || null;
         setDisks(nextDisks);
         selectedDiskRef.current = nextSelectedDisk;
         setSelectedPath(nextSelectedDisk?.path || "");
@@ -2343,7 +2481,7 @@ function App() {
     };
   }, [refresh]);
 
-  const activeScan = Boolean(activeJob && (activeJob.type === "scan" || activeJob.type === "write"));
+  const activeScan = Boolean(activeJob && !activeJob.options?.scanRepairFrom && (activeJob.type === "scan" || activeJob.type === "write"));
   // Keep a low-frequency full-job sync alongside incremental cell updates.
   // This also supports older packaged backends that do not expose scan-progress.
   const pollInterval = activeScan ? ACTIVE_SCAN_FALLBACK_POLL_MS : (activeJob ? 300 : 6000);
@@ -2549,6 +2687,14 @@ function App() {
     });
   }
 
+  function openRecordedRepair(job) {
+    if (recordedRepairBlockedReason || controlsLocked) return;
+    const disk = snapshotDisk(selectedDisk);
+    if (!disk || !jobBelongsToDisk(job, selectedDisk)) return;
+    setActionError("");
+    setRecordedRepairRequest({ job, disk });
+  }
+
   function cancelResumeLookup() {
     resumeLookupRef.current?.abort();
     resumeLookupRef.current = null;
@@ -2557,6 +2703,7 @@ function App() {
   }
 
   function selectMode(nextMode) {
+    initialSelectionPendingRef.current = false;
     cancelResumeLookup();
     setMode(nextMode);
     setSelectedJob(null);
@@ -2564,6 +2711,7 @@ function App() {
 
   function selectDisk(path) {
     if (controlsLocked) return;
+    initialSelectionPendingRef.current = false;
     cancelResumeLookup();
     setScanRepair(false);
     const nextDisk = disks.find((disk) => disk.path === path) || null;
@@ -2578,6 +2726,7 @@ function App() {
     cancelResumeLookup();
     const target = speedTargets.find((candidate) => candidate.key === key && !candidate.disabledReason);
     if (!target) return;
+    initialSelectionPendingRef.current = false;
     setSelectedSpeedKey(target.key);
     if (target.type === "filesystem") {
       selectedStorageRef.current = target.storageSpace;
@@ -2593,6 +2742,7 @@ function App() {
 
   function selectHistoryJob(job) {
     if (controlsLocked) return;
+    initialSelectionPendingRef.current = false;
     cancelResumeLookup();
     jobsVersionRef.current += 1;
     invalidateRefresh();
@@ -2622,8 +2772,43 @@ function App() {
     }
   }
 
+  async function returnToScan(repairJob) {
+    const sourceId = repairJob.options?.scanRepairFrom;
+    if (!sourceId || controlsLocked || returnToScanRef.current) return;
+    const controller = new AbortController();
+    returnToScanRef.current = controller;
+    setReturningRepairId(repairJob.id);
+    setActionError("");
+    try {
+      const source = jobsRef.current.find((job) => job.id === sourceId)
+        || readJob(await api(`/jobs/${sourceId}`, { signal: controller.signal }), "读取来源扫描记录");
+      if (controller.signal.aborted || !mountedRef.current) return;
+      if (source.id !== sourceId || !["scan", "write"].includes(source.type) || source.options?.scanRepairFrom
+        || !jobBelongsToDisk(source, { ...repairJob.disk, path: repairJob.device })) {
+        throw new Error("来源扫描记录与本次修复不匹配");
+      }
+      selectHistoryJob(source);
+    } catch (error) {
+      if (!controller.signal.aborted && mountedRef.current) {
+        setActionError(error.status === 404
+          ? "来源扫描记录已删除，可通过历史记录查看其他扫描结果。"
+          : `返回扫描结果失败：${errorMessage(error)}`);
+      }
+    } finally {
+      if (returnToScanRef.current === controller) {
+        returnToScanRef.current = null;
+        if (mountedRef.current) setReturningRepairId("");
+      }
+    }
+  }
+
   async function createJob(options) {
     if (createPendingRef.current || controlsLocked) return;
+    if (options.scanRepairFrom && health?.capabilities?.recordedRepair !== true) {
+      setActionError("当前后台不支持按记录修复，请更新并重启应用");
+      return;
+    }
+    initialSelectionPendingRef.current = false;
     createPendingRef.current = true;
     setCreatingJob(true);
     setActionError("");
@@ -2636,6 +2821,7 @@ function App() {
       setJobs((current) => [job, ...current.filter((item) => item?.id !== job.id)]);
       setSelectedJob(job);
       setConfirmRequest(null);
+      setRecordedRepairRequest(null);
       setResumeRequest(null);
     } catch (err) {
       if (mountedRef.current) setActionError(errorMessage(err));
@@ -2804,6 +2990,11 @@ function App() {
                     speedStartDisabled={!selectedSpeedTarget || controlsLocked || health?.capabilities?.scan !== true || health?.capabilities?.fio !== true}
                     onPlaybackChange={handlePlaybackChange}
                     onOpenHistory={() => setHistoryOpen(true)}
+                    onRepairRecords={openRecordedRepair}
+                    repairDisabledReason={recordedRepairBlockedReason}
+                    onReturnToScan={returnToScan}
+                    returningRepairId={returningRepairId}
+                    returnDisabled={controlsLocked}
                   />
                 </div>
               </div>
@@ -2811,6 +3002,7 @@ function App() {
           </div>
         </main>
       </div>
+      {recordedRepairRequest && <RecordedRepairDialog request={recordedRepairRequest} submitting={creatingJob} error={actionError} onClose={() => { if (!creatingJob) setRecordedRepairRequest(null); }} onConfirm={createJob} />}
       {confirmRequest && (
         <ConfirmDialog
           request={confirmRequest}
@@ -2839,4 +3031,4 @@ function App() {
   );
 }
 
-createRoot(document.getElementById("root")).render(<App />);
+createRoot(document.getElementById("root")).render(<ImmediateTooltipProvider><App /></ImmediateTooltipProvider>);

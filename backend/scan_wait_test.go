@@ -14,10 +14,14 @@ type blockedScanHandle struct {
 	releaseClose chan struct{}
 	once         sync.Once
 	calls        atomic.Int64
+	firstReads   atomic.Int64
 }
 
 func (h *blockedScanHandle) ReadAt(p []byte, offset int64) (int, error) {
 	h.calls.Add(1)
+	if offset == 0 {
+		h.firstReads.Add(1)
+	}
 	h.once.Do(func() { close(h.started) })
 	<-h.releaseRead
 	return len(p), nil
@@ -115,7 +119,7 @@ func TestHostReadTimeoutNeverRetriesWhileOriginalReadIsPending(t *testing.T) {
 	for {
 		snapshot := m.get(job.ID)
 		result := snapshot.Result.(*ScanResult)
-		if result.Stats.DeviceErrorRanges == 1 {
+		if snapshot.Phase == "读取超时，等待设备请求结束" {
 			if snapshot.Status != "running" || result.Stats.UnreadableRanges != 0 || result.Stats.CoveredBytes != 0 {
 				t.Fatalf("wrong pending timeout state: %+v", snapshot)
 			}
@@ -130,12 +134,55 @@ func TestHostReadTimeoutNeverRetriesWhileOriginalReadIsPending(t *testing.T) {
 		t.Fatalf("retry overlapped pending I/O: %d", h.calls.Load())
 	}
 	close(h.releaseRead)
-	done := waitForStatus(t, m, job.ID, "failed", 2*time.Second)
+	done := waitForStatus(t, m, job.ID, "completed", 2*time.Second)
 	result := done.Result.(*ScanResult)
-	if result.Stats.UnreadableBytes != 0 || result.Stats.DeviceErrorRanges != 1 || result.Map[1].Status != "pending" {
+	if result.Stats.UnreadableBytes != 0 || result.Stats.DeviceErrorRanges != 1 || result.Stats.SkippedBytes != 4096 || result.Stats.CoveredBytes != done.Disk.Size-4096 || result.Map[1].Status == "pending" {
 		t.Fatalf("timeout polluted scan results: %+v", result.Stats)
 	}
-	if h.calls.Load() != 1 {
-		t.Fatalf("submitted reads after timeout: %d", h.calls.Load())
+	// Scheduling stalls can trigger a valid recheck of a later healthy cell.
+	// Account for those reads, while forbidding a retry of the timed-out LBA.
+	wantCalls := int64(4096)
+	for _, cell := range result.Map {
+		if cell.Recheck != nil {
+			wantCalls += cell.Recheck.Reads
+		}
+	}
+	if h.firstReads.Load() != 1 || h.calls.Load() != wantCalls {
+		t.Fatalf("unexpected reads after the timed-out request settled: first LBA=%d, total=%d, want=%d", h.firstReads.Load(), h.calls.Load(), wantCalls)
+	}
+}
+
+func TestCancelWhileWaitingForTimedOutReadDoesNotContinueToNextRegion(t *testing.T) {
+	m, job, h := blockedScanManager(t, 20*time.Millisecond)
+	defer func() {
+		select {
+		case <-h.releaseRead:
+		default:
+			close(h.releaseRead)
+		}
+		select {
+		case <-h.releaseClose:
+		default:
+			close(h.releaseClose)
+		}
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for m.get(job.ID).Phase != "读取超时，等待设备请求结束" {
+		if time.Now().After(deadline) {
+			t.Fatal("host timeout did not become visible")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if _, err := m.cancel(job.ID); err != nil {
+		t.Fatal(err)
+	}
+	if h.calls.Load() != 1 || m.get(job.ID).Status != "cancelling" {
+		t.Fatal("cancellation lost device occupancy while the request was pending")
+	}
+	close(h.releaseRead)
+	close(h.releaseClose)
+	done := waitForStatus(t, m, job.ID, "cancelled", 2*time.Second)
+	if h.calls.Load() != 1 || done.Result.(*ScanResult).Stats.UnreadableBytes != 0 {
+		t.Fatal("continued after cancellation or invented unreadable sectors")
 	}
 }

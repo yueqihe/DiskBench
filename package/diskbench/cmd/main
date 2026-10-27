@@ -33,7 +33,7 @@ start_app() {
     chmod 0755 ./bin/* 2>/dev/null || true
   fi
   umask 007
-  DATA_DIR="$TRIM_PKGVAR" GATEWAY_PREFIX="/app/diskbench" SOCKET_PATH="$SOCKET_PATH" \
+  LOCAL_DEV=0 MOCK_DEV=0 DATA_DIR="$TRIM_PKGVAR" GATEWAY_PREFIX="/app/diskbench" SOCKET_PATH="$SOCKET_PATH" \
     ./diskbench >> "$LOG_FILE" 2>&1 &
   echo "$!" > "$PID_FILE"
 }

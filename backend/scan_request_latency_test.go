@@ -13,9 +13,11 @@ func TestRequestLatencyThresholds(t *testing.T) {
 		want string
 	}{
 		{19.99, false, "normal"}, {20, false, "slow"}, {49.99, false, "slow"},
-		{50, false, "slower"}, {99.99, false, "slower"}, {100, false, "severe"}, {172, false, "severe"},
+		{50, false, "slower"}, {100, false, "slower"}, {499.99, false, "slower"},
+		{500, false, "severe"}, {500.01, false, "severe"}, {1000, false, "severe"},
 		{49.99, true, "normal"}, {50, true, "slow"}, {149.99, true, "slow"},
-		{150, true, "slower"}, {499.99, true, "slower"}, {500, true, "severe"},
+		{150, true, "slow"}, {199.99, true, "slow"}, {200, true, "slower"},
+		{799.99, true, "slower"}, {800, true, "severe"}, {800.01, true, "severe"},
 	} {
 		if got := scanRequestStatus(tc.ms, tc.hdd); got != tc.want {
 			t.Errorf("ms=%v hdd=%v: %s, want %s", tc.ms, tc.hdd, got, tc.want)
@@ -23,17 +25,59 @@ func TestRequestLatencyThresholds(t *testing.T) {
 	}
 }
 
+func TestMediaLatencyUsesWorstRequestOrTransferAndPreservesErrors(t *testing.T) {
+	m := newTestManager(t, JobManagerOptions{})
+	for _, tc := range []struct {
+		name     string
+		hdd      bool
+		transfer float64
+		request  float64
+		want     string
+	}{
+		{"ssd-transfer-poor", false, 50, 1, "slower"},
+		{"ssd-request-poor", false, 1, 50, "slower"},
+		{"ssd-transfer-red", false, 500, 1, "severe"},
+		{"ssd-request-red", false, 1, 500, "severe"},
+		{"hdd-150-is-general", true, 150, 150, "slow"},
+		{"hdd-below-poor", true, 199.99, 199.99, "slow"},
+		{"hdd-transfer-poor", true, 200, 1, "slower"},
+		{"hdd-request-poor", true, 1, 200, "slower"},
+		{"hdd-below-red", true, 799.99, 799.99, "slower"},
+		{"hdd-transfer-red", true, 800, 1, "severe"},
+		{"hdd-request-red", true, 1, 800, "severe"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cell := &ScanCell{}
+			m.updateCell(cell, tc.transfer, 1024*1024, 0, 1024*1024)
+			applyScanReadLatency(cell, &ScanReadLatency{Ms: tc.request, Bytes: 128 * 1024}, tc.hdd)
+			if cell.Status != tc.want {
+				t.Fatalf("initial verdict %s, want %s", cell.Status, tc.want)
+			}
+			m.updateCell(cell, 1, 1024*1024, 0, 1024*1024)
+			applyScanReadLatency(cell, &ScanReadLatency{Ms: 1, Bytes: 128 * 1024}, tc.hdd)
+			if cell.Status != tc.want {
+				t.Fatalf("later fast read erased verdict: %s", cell.Status)
+			}
+			m.updateCell(cell, 1, 0, 1, 512)
+			applyScanReadLatency(cell, nil, tc.hdd)
+			if cell.Status != "error" {
+				t.Fatal("timing hid a read error")
+			}
+		})
+	}
+}
+
 func TestRequestStallSurvivesNormalizationLaterReadsAndRecovery(t *testing.T) {
 	m := newTestManager(t, JobManagerOptions{})
 	cell := &ScanCell{}
-	m.updateCell(cell, 172, 8*1024*1024, 0, 8*1024*1024)
-	applyScanReadLatency(cell, &ScanReadLatency{Ms: 172, Bytes: 128 * 1024, Offset: 0}, false)
-	if cell.Status != "severe" || *cell.MaxUnitMs != 21.5 {
+	m.updateCell(cell, 1000, 8*1024*1024, 0, 8*1024*1024)
+	applyScanReadLatency(cell, &ScanReadLatency{Ms: 1000, Bytes: 128 * 1024, Offset: 0}, false)
+	if cell.Status != "severe" || *cell.MaxUnitMs != 125 {
 		t.Fatalf("stall diluted: %+v", cell)
 	}
 	m.updateCell(cell, 8, 8*1024*1024, 0, 8*1024*1024)
 	applyScanReadLatency(cell, &ScanReadLatency{Ms: 1, Bytes: 128 * 1024, Offset: 8 * 1024 * 1024}, false)
-	if cell.Status != "severe" || cell.MaxReadLatency.Ms != 172 {
+	if cell.Status != "severe" || cell.MaxReadLatency.Ms != 1000 {
 		t.Fatal("later fast read erased stall")
 	}
 	m.updateCell(cell, 1, 0, 1, 512)
@@ -48,11 +92,19 @@ func TestRequestStallSurvivesNormalizationLaterReadsAndRecovery(t *testing.T) {
 	if healthy.Status != "normal" {
 		t.Fatal("normal HDD throughput classified as stall")
 	}
-	// Neither the absolute policy nor a later transfer may lower HDD evidence.
+	// Relative slowdowns warn without lowering the absolute poor/red thresholds.
 	applyHDDLatency(healthy, "relative-severe", 12)
 	applyScanReadLatency(healthy, nil, true)
-	if healthy.Status != "severe" {
+	if healthy.Status != "slow" {
 		t.Fatal("lost relative evidence")
+	}
+	applyScanReadLatency(healthy, &ScanReadLatency{Ms: 799.99, Bytes: 128 * 1024}, true)
+	if healthy.Status != "slower" {
+		t.Fatal("relative slowdown bypassed the absolute red threshold")
+	}
+	applyScanReadLatency(healthy, &ScanReadLatency{Ms: 800, Bytes: 128 * 1024}, true)
+	if healthy.Status != "severe" {
+		t.Fatal("absolute red threshold was not applied")
 	}
 }
 

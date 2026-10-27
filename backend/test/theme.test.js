@@ -7,7 +7,12 @@ const path = require("node:path");
 const vm = require("node:vm");
 
 const html = fs.readFileSync(path.join(__dirname, "../../frontend/index.html"), "utf8");
-const script = html.match(/<script>([\s\S]*?)<\/script>/)?.[1];
+const script = fs.readFileSync(path.join(__dirname, "../../frontend/public/theme-init.js"), "utf8");
+
+test("theme initialization uses a same-origin script permitted by the production CSP", () => {
+  assert.match(html, /<script src="\/theme-init\.js"><\/script>/);
+  assert.doesNotMatch(html, /<script>\s*[\s\S]+?<\/script>/);
+});
 
 function initialTheme(preference, systemDark = false, storageUnavailable = false) {
   const root = { dataset: {}, style: {} };
