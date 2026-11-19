@@ -113,11 +113,31 @@ test("parallel scan selection and admission follow each physical disk", () => {
   assert.match(taskStartBlockedReason(jobs, "scan", a), /这块硬盘/);
   assert.match(taskStartBlockedReason(jobs, "scan", { ...a, path: "/dev/sdz" }), /这块硬盘/);
   assert.match(taskStartBlockedReason(jobs, "scan", { ...a, serial: "replacement" }), /这块硬盘/);
-  assert.match(taskStartBlockedReason(jobs, "speed", c), /测速/);
-  assert.match(taskStartBlockedReason([{ ...first, type: "speed" }], "scan", c), /测速/);
-  const space = { path: "/vol1", members: [a.path] };
-  const speed = { ...first, type: "speed", device: space.path, storageSpace: space };
-  const target = { type: "filesystem", path: space.path, storageSpace: space };
+});
+
+test("speed and scan may overlap only on separate physical disks", () => {
+  const a = { path: "/dev/sda", serial: "A" };
+  const b = { path: "/dev/sdb", serial: "B" };
+  const c = { path: "/dev/sdc", serial: "C" };
+  const scan = { type: "scan", status: "running", device: b.path, disk: b };
+  const raw = { type: "raw", path: c.path, disk: c };
+  const rawJob = { type: "speed", status: "running", device: c.path, disk: c };
+  const space = { path: "/vol1", members: [a.path, b.path] };
+  const target = { type: "filesystem", path: space.path, storageSpace: space, memberDisks: [a, b] };
+  const speed = { type: "speed", status: "running", device: space.path, storageSpace: { ...space, memberDisks: [a, b] } };
+
+  assert.equal(taskStartBlockedReason([scan], "speed", b, raw), "");
+  assert.equal(taskStartBlockedReason([rawJob], "scan", b), "");
+  assert.match(taskStartBlockedReason([scan], "speed", c, { ...raw, disk: b }), /同一块硬盘/);
+  assert.match(taskStartBlockedReason([rawJob], "scan", c), /同一块硬盘/);
+  assert.match(taskStartBlockedReason([scan], "speed", c, target), /同一块硬盘/);
+  assert.match(taskStartBlockedReason([{ ...scan, device: "/dev/sdz" }], "speed", c, target), /同一块硬盘/);
+  assert.match(taskStartBlockedReason([speed], "scan", b), /同一块硬盘/);
+  assert.match(taskStartBlockedReason([speed], "scan", { ...b, path: "/dev/sdz" }), /同一块硬盘/);
+  assert.equal(taskStartBlockedReason([speed], "scan", c), "");
+  assert.match(taskStartBlockedReason([{ ...speed, storageSpace: { ...space, members: [] } }], "scan", c), /无法确认/);
+  assert.match(taskStartBlockedReason([{ ...speed, status: "cancelling" }, scan], "speed", c, raw), /一次只能运行一个/);
+  assert.equal(taskStartBlockedReason([{ ...speed, status: "completed" }], "speed", c, raw), "");
   assert.equal(activeJobForTarget([speed], "speed", a, target), speed);
 });
 

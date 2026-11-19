@@ -350,13 +350,19 @@ func validateCreateJobBody(body map[string]interface{}) error {
 	if v, ok := body["sampleMiB"]; ok && v != nil {
 		n, ok := toInt64(v)
 		if !ok || !speedSizes[n] {
-			return newJobError("sampleMiB 必须是 256、1024 或 4096", "INVALID_ARGUMENT", 400)
+			return newJobError("sampleMiB 必须是支持的测试文件大小（16 MiB～64 GiB）", "INVALID_ARGUMENT", 400)
 		}
 	}
 	if v, ok := body["speedRuns"]; ok && v != nil {
 		n, ok := toInt64(v)
 		if !ok || !speedRuns[n] {
-			return newJobError("speedRuns 必须是 1、3 或 5", "INVALID_ARGUMENT", 400)
+			return newJobError("speedRuns 必须是 1～9 的整数", "INVALID_ARGUMENT", 400)
+		}
+	}
+	if v, ok := body["speedPreset"]; ok && v != nil {
+		preset, _ := v.(string)
+		if !isCrystalSpeedPreset(preset) {
+			return newJobError("speedPreset 无效", "INVALID_ARGUMENT", 400)
 		}
 	}
 	if v, ok := body["speedPosition"]; ok && v != nil {

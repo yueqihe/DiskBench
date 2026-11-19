@@ -687,7 +687,8 @@ func TestCreateRejectsInvalidOptions(t *testing.T) {
 	}{
 		{"scan", map[string]interface{}{"scanMode": "ful"}, "INVALID_SCAN_MODE"},
 		{"speed", map[string]interface{}{"sampleMiB": float64(123), "speedPosition": "all"}, "INVALID_SAMPLE_SIZE"},
-		{"speed", map[string]interface{}{"sampleMiB": float64(256), "speedRuns": float64(2)}, "INVALID_SPEED_RUNS"},
+		{"speed", map[string]interface{}{"sampleMiB": float64(256), "speedRuns": float64(10)}, "INVALID_SPEED_RUNS"},
+		{"speed", map[string]interface{}{"speedPreset": "invalid"}, "INVALID_SPEED_PRESET"},
 		{"speed", map[string]interface{}{"sampleMiB": float64(256), "speedPosition": "middel"}, "INVALID_SPEED_POSITION"},
 		{"speed", map[string]interface{}{"sampleMiB": float64(256), "speedOperation": "invalid"}, "INVALID_SPEED_OPERATION"},
 		{"speed", map[string]interface{}{"sampleMiB": float64(256), "speedQueueDepth": float64(7)}, "INVALID_SPEED_QUEUE_DEPTH"},

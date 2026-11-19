@@ -41,8 +41,8 @@ const (
 )
 
 var (
-	speedSizes       = map[int64]bool{256: true, 1024: true, 4096: true}
-	speedRuns        = map[int64]bool{1: true, 3: true, 5: true}
+	speedSizes       = map[int64]bool{16: true, 32: true, 64: true, 128: true, 256: true, 512: true, 1024: true, 2048: true, 4096: true, 8192: true, 16384: true, 32768: true, 65536: true}
+	speedRuns        = map[int64]bool{1: true, 2: true, 3: true, 4: true, 5: true, 6: true, 7: true, 8: true, 9: true}
 	speedPositions   = map[string]bool{"all": true, "start": true, "middle": true, "end": true}
 	speedOperations  = map[string]bool{"read": true, "write": true, "mixed": true}
 	speedPatterns    = map[string]bool{"sequential": true, "random": true}
@@ -145,38 +145,41 @@ type DiskSnapshot struct {
 }
 
 type StorageSpaceSnapshot struct {
-	Path       string   `json:"path"`
-	Source     string   `json:"source"`
-	FileSystem string   `json:"fileSystem"`
-	Layout     string   `json:"layout"`
-	Members    []string `json:"members"`
-	Size       int64    `json:"size"`
-	ReadOnly   bool     `json:"readOnly"`
-	IsSystem   bool     `json:"isSystem,omitempty"`
+	Path        string         `json:"path"`
+	Source      string         `json:"source"`
+	FileSystem  string         `json:"fileSystem"`
+	Layout      string         `json:"layout"`
+	Members     []string       `json:"members"`
+	MemberDisks []DiskSnapshot `json:"memberDisks,omitempty"`
+	Size        int64          `json:"size"`
+	ReadOnly    bool           `json:"readOnly"`
+	IsSystem    bool           `json:"isSystem,omitempty"`
 }
 
 type JobOptions struct {
-	ScanRepairFrom    string  `json:"scanRepairFrom,omitempty"`
-	ScanDeepLocate    *bool   `json:"scanDeepLocate,omitempty"`
-	ScanMode          *string `json:"scanMode,omitempty"`
-	ScanExactSectors  *bool   `json:"scanExactSectors,omitempty"`
-	ScanSelfTest      *bool   `json:"scanSelfTest,omitempty"`
-	ScanRepair        *bool   `json:"scanRepair,omitempty"`
-	ScanRepairAfterMs *int64  `json:"scanRepairAfterMs,omitempty"`
-	SampleMiB         *int64  `json:"sampleMiB,omitempty"`
-	SpeedRuns         *int64  `json:"speedRuns,omitempty"` // 1 | 3 | 5
-	SpeedPosition     *string `json:"speedPosition,omitempty"`
-	SpeedOperation    *string `json:"speedOperation,omitempty"`  // "read" | "write"
-	SpeedPattern      *string `json:"speedPattern,omitempty"`    // "sequential" | "random"
-	SpeedBlockSize    *int64  `json:"speedBlockSize,omitempty"`  // 4096 | 65536 | 1048576 | 4194304
-	SpeedQueueDepth   *int64  `json:"speedQueueDepth,omitempty"` // 1 | 8 | 16 | 32 | 64 | 128
-	SpeedThreads      *int64  `json:"speedThreads,omitempty"`
-	SpeedIOEngine     *string `json:"speedIOEngine,omitempty"`
-	SpeedDirectIO     *bool   `json:"speedDirectIO,omitempty"`
-	SpeedTrim         *bool   `json:"speedTrim,omitempty"`
-	SpeedProfile      *bool   `json:"speedProfile,omitempty"`
-	SpeedProfileRow   *string `json:"speedProfileRow,omitempty"`
-	SpeedTarget       *string `json:"speedTarget,omitempty"`
+	ScanRepairFrom       string  `json:"scanRepairFrom,omitempty"`
+	ScanDeepLocate       *bool   `json:"scanDeepLocate,omitempty"`
+	ScanMode             *string `json:"scanMode,omitempty"`
+	ScanExactSectors     *bool   `json:"scanExactSectors,omitempty"`
+	ScanSelfTest         *bool   `json:"scanSelfTest,omitempty"`
+	ScanRepair           *bool   `json:"scanRepair,omitempty"`
+	ScanRepairAfterMs    *int64  `json:"scanRepairAfterMs,omitempty"`
+	SampleMiB            *int64  `json:"sampleMiB,omitempty"`
+	SpeedDurationSeconds *int64  `json:"speedDurationSeconds,omitempty"`
+	SpeedRuns            *int64  `json:"speedRuns,omitempty"`
+	SpeedPreset          string  `json:"speedPreset,omitempty"`
+	SpeedPosition        *string `json:"speedPosition,omitempty"`
+	SpeedOperation       *string `json:"speedOperation,omitempty"`  // "read" | "write" | "mixed"
+	SpeedPattern         *string `json:"speedPattern,omitempty"`    // "sequential" | "random"
+	SpeedBlockSize       *int64  `json:"speedBlockSize,omitempty"`  // 4096 | 65536 | 1048576 | 4194304
+	SpeedQueueDepth      *int64  `json:"speedQueueDepth,omitempty"` // 1 | 8 | 16 | 32 | 64 | 128
+	SpeedThreads         *int64  `json:"speedThreads,omitempty"`
+	SpeedIOEngine        *string `json:"speedIOEngine,omitempty"`
+	SpeedDirectIO        *bool   `json:"speedDirectIO,omitempty"`
+	SpeedTrim            *bool   `json:"speedTrim,omitempty"`
+	SpeedProfile         *bool   `json:"speedProfile,omitempty"`
+	SpeedProfileRow      *string `json:"speedProfileRow,omitempty"`
+	SpeedTarget          *string `json:"speedTarget,omitempty"`
 }
 
 type BadRange struct {
@@ -285,6 +288,7 @@ type ScanProgressSnapshot struct {
 type SpeedSample struct {
 	Label       string  `json:"label"`
 	OffsetBytes int64   `json:"offsetBytes"`
+	RangeBytes  int64   `json:"rangeBytes,omitempty"`
 	Bytes       int64   `json:"bytes"`
 	Seconds     float64 `json:"seconds"`
 	MBps        float64 `json:"mbps"`
@@ -338,6 +342,7 @@ type Job struct {
 	Device              string                `json:"device"`
 	Disk                DiskSnapshot          `json:"disk"`
 	StorageSpace        *StorageSpaceSnapshot `json:"storageSpace,omitempty"`
+	SpeedLive           *SpeedLiveStatus      `json:"speedLive,omitempty"`
 	Status              string                `json:"status"`
 	HistoryOrder        int                   `json:"historyOrder"`
 	Progress            float64               `json:"progress"`
@@ -669,6 +674,7 @@ func summarizeJobJSON(job *Job) map[string]interface{} {
 		"finishedAt":          job.FinishedAt,
 		"message":             job.Message,
 		"options":             job.Options,
+		"speedLive":           job.SpeedLive,
 		"resume":              scanResumeInfo(job),
 		"resumeFrom":          job.ResumeFrom,
 		"resumeStartProgress": job.ResumeStartProgress,
@@ -702,9 +708,18 @@ func cloneJobLocked(job *Job) *Job {
 	}
 	cloned := *job
 	cloned.Log = append([]string(nil), job.Log...)
+	if job.SpeedLive != nil {
+		live := *job.SpeedLive
+		if live.MBps != nil {
+			value := *live.MBps
+			live.MBps = &value
+		}
+		cloned.SpeedLive = &live
+	}
 	if job.StorageSpace != nil {
 		space := *job.StorageSpace
 		space.Members = append([]string(nil), job.StorageSpace.Members...)
+		space.MemberDisks = append([]DiskSnapshot(nil), job.StorageSpace.MemberDisks...)
 		cloned.StorageSpace = &space
 	}
 	switch result := job.Result.(type) {
@@ -877,6 +892,7 @@ func (m *JobManager) loadJobs() {
 		if err := json.Unmarshal(data, &job); err != nil {
 			continue
 		}
+		job.SpeedLive = nil
 		if !jobIDPattern.MatchString(job.ID) || job.ID != id {
 			continue
 		}
@@ -1239,6 +1255,7 @@ func (m *JobManager) complete(job *Job, result interface{}, message string) {
 	if job.Status == "cancelling" {
 		return
 	}
+	job.SpeedLive = nil
 	job.Status = "completed"
 	job.Progress = 100
 	switch job.Type {
@@ -1270,6 +1287,7 @@ func (m *JobManager) fail(job *Job, err error) {
 	if job.Status == "cancelling" {
 		status = "cancelled"
 	}
+	job.SpeedLive = nil
 	job.Status = status
 	finished := isoTime(m.now())
 	job.FinishedAt = &finished
@@ -2103,6 +2121,8 @@ func (m *JobManager) create(typeName, devicePath string, options map[string]inte
 	speedTrim, _ := options["speedTrim"].(bool)
 	speedProfile, _ := options["speedProfile"].(bool)
 	speedProfileRow, _ := options["speedProfileRow"].(string)
+	speedPreset, _ := options["speedPreset"].(string)
+	crystal := typeName == "speed" && isCrystalSpeedPreset(speedPreset)
 	speedTargetMode, _ := options["speedTarget"].(string)
 	rawWriteAcknowledged, _ := options["rawWriteAcknowledged"].(bool)
 	var expectedDisk *Disk
@@ -2122,6 +2142,9 @@ func (m *JobManager) create(typeName, devicePath string, options map[string]inte
 	}
 	if typeName == "speed" && options["speedRuns"] != nil && !speedRuns[runs] {
 		return nil, newJobError("测速次数无效", "INVALID_SPEED_RUNS", 400)
+	}
+	if typeName == "speed" && options["speedPreset"] != nil && !crystal {
+		return nil, newJobError("测速预设无效", "INVALID_SPEED_PRESET", 400)
 	}
 	if typeName == "speed" && speedPosition != "" && !speedPositions[speedPosition] {
 		return nil, newJobError("测速位置无效", "INVALID_SPEED_POSITION", 400)
@@ -2147,7 +2170,7 @@ func (m *JobManager) create(typeName, devicePath string, options map[string]inte
 	if typeName == "speed" && speedIOEngine == "psync" && speedQueueDepth > 1 {
 		return nil, newJobError("psync 仅支持队列深度 1", "INVALID_SPEED_QUEUE_DEPTH", 400)
 	}
-	if typeName == "speed" && speedProfileRow != "" && (!speedProfile || !speedProfileRows[speedProfileRow]) {
+	if typeName == "speed" && speedProfileRow != "" && ((!speedProfile && !crystal) || !speedProfileRows[speedProfileRow]) {
 		return nil, newJobError("测速矩阵行无效", "INVALID_SPEED_PROFILE_ROW", 400)
 	}
 	if typeName == "speed" && speedTargetMode != "" && !speedTargetModes[speedTargetMode] {
@@ -2186,6 +2209,9 @@ func (m *JobManager) create(typeName, devicePath string, options map[string]inte
 		candidate.Device, candidate.Disk.Serial = disk.Path, disk.Serial
 	} else if space != nil {
 		candidate.Device = space.Path
+		snapshot := storageSnapshot(space)
+		snapshot.MemberDisks = m.snapshotStorageDisks(space)
+		candidate.StorageSpace = &snapshot
 	}
 	m.mu.Lock()
 	admissionErr := m.jobAdmissionErrorLocked(candidate)
@@ -2301,6 +2327,9 @@ func (m *JobManager) create(typeName, devicePath string, options map[string]inte
 	}
 	if !speedRuns[runs] {
 		runs = 1
+		if crystal {
+			runs = crystalSpeedDefaultRuns
+		}
 	}
 	if !speedPositions[speedPosition] {
 		speedPosition = "all"
@@ -2314,7 +2343,12 @@ func (m *JobManager) create(typeName, devicePath string, options map[string]inte
 	if !directIOProvided {
 		speedDirectIO = true
 	}
-	if speedProfile {
+	if crystal {
+		speedPosition = "start"
+		if speedPreset == crystalSpeedPreset {
+			speedBlockSize, speedQueueDepth, speedThreadCount = 0, 0, 0
+		}
+	} else if speedProfile {
 		if !speedBlockSizes[speedBlockSize] {
 			speedBlockSize = sequentialBenchmarkSize
 		}
@@ -2337,7 +2371,7 @@ func (m *JobManager) create(typeName, devicePath string, options map[string]inte
 		if speedTrim && !m.mock && m.findExecutable("fstrim") == "" {
 			return nil, newJobError("系统未找到 fstrim，无法在测速前执行 TRIM", "CAPABILITY_UNAVAILABLE", 503)
 		}
-		if len(selectSpeedBenchmarks(speedOperation, speedPattern, speedBlockSize, speedQueueDepth, speedThreadCount, writeAllowed, speedProfile, speedProfileRow)) == 0 {
+		if len(speedJobBenchmarks(speedPreset, speedOperation, speedPattern, speedBlockSize, speedQueueDepth, speedThreadCount, writeAllowed, speedProfile, speedProfileRow, speedIOEngine)) == 0 {
 			return nil, newJobError("所选测速组合不存在", "INVALID_SPEED_COMBINATION", 400)
 		}
 		fileSize := sampleMiB * 1024 * 1024
@@ -2411,6 +2445,11 @@ func (m *JobManager) create(typeName, devicePath string, options map[string]inte
 	if typeName == "speed" {
 		optionsField.SampleMiB = intPtr(sampleMiB)
 		optionsField.SpeedRuns = intPtr(runs)
+		optionsField.SpeedDurationSeconds = intPtr(speedDurationSeconds)
+		if crystal {
+			optionsField.SpeedPreset = speedPreset
+			optionsField.SpeedDurationSeconds = intPtr(crystalSpeedDurationSeconds)
+		}
 		optionsField.SpeedPosition = strPtr(speedPosition)
 		optionsField.SpeedIOEngine = strPtr(speedIOEngine)
 		optionsField.SpeedDirectIO = boolPtr(speedDirectIO)
@@ -2449,11 +2488,8 @@ func (m *JobManager) create(typeName, devicePath string, options map[string]inte
 
 	device := ""
 	diskSnapshot := DiskSnapshot{}
-	var spaceSnapshot *StorageSpaceSnapshot
 	if typeName == "speed" && speedTargetMode == "filesystem" {
 		device = space.Path
-		snapshot := storageSnapshot(space)
-		spaceSnapshot = &snapshot
 		diskSnapshot = DiskSnapshot{
 			Name: path.Base(space.Path), Model: strings.ToUpper(space.FileSystem), Size: space.Size,
 			LogicalSectorSize: 4096, PhysicalSectorSize: 4096,
@@ -2473,7 +2509,7 @@ func (m *JobManager) create(typeName, devicePath string, options map[string]inte
 		Type:         typeName,
 		Device:       device,
 		Disk:         diskSnapshot,
-		StorageSpace: spaceSnapshot,
+		StorageSpace: candidate.StorageSpace,
 		Status:       "queued",
 		Progress:     0,
 		Phase:        phase,
@@ -2494,8 +2530,8 @@ func (m *JobManager) create(typeName, devicePath string, options map[string]inte
 	}
 
 	m.mu.Lock()
-	// Admit jobs atomically after resolving their real device identity. Separate
-	// disks can scan together; a cancelled request owns its disk until I/O settles.
+	// Recheck under the same lock used to publish the job, since another request
+	// can claim this disk (or the single speed slot) during preparation.
 	if err := m.jobAdmissionErrorLocked(job); err != nil {
 		m.mu.Unlock()
 		m.removeScanIssueFile(job.ID)
@@ -3225,20 +3261,22 @@ func combineBenchmarkRuns(spec benchmarkSpec, results []BenchmarkResult) Benchma
 	}
 	for sampleIndex, base := range results[0].Samples {
 		var totalSeconds float64
+		var totalBytes int64
 		for _, result := range results {
 			if sampleIndex >= len(result.Samples) {
 				continue
 			}
 			sample := result.Samples[sampleIndex]
 			totalSeconds += sample.Seconds
+			totalBytes += sample.Bytes
 		}
-		averageSeconds := totalSeconds / float64(len(results))
-		mbps := round1(float64(base.Bytes) / averageSeconds / 1e6)
+		mbps := round1(float64(totalBytes) / totalSeconds / 1e6)
 		combined.Samples = append(combined.Samples, SpeedSample{
 			Label:       base.Label,
 			OffsetBytes: base.OffsetBytes,
-			Bytes:       base.Bytes,
-			Seconds:     averageSeconds,
+			RangeBytes:  speedSampleRangeBytes(base),
+			Bytes:       totalBytes,
+			Seconds:     totalSeconds,
 			MBps:        mbps,
 		})
 	}
@@ -3269,29 +3307,31 @@ func (m *JobManager) runMockSpeed(job *Job, sampleMiB, runs int64, speedPosition
 	if err := m.start(job); err != nil {
 		return err
 	}
-	specs := selectSpeedBenchmarks(speedOperation, speedPattern, speedBlockSize, speedQueueDepth, speedThreadCount, writeAllowed, speedProfile, speedProfileRow)
-	var benchmarks []BenchmarkResult
-	for i, spec := range specs {
-		var runResults []BenchmarkResult
-		for run := int64(0); run < runs; run++ {
-			benchmark, err := m.mockBenchmark(job, spec, sampleMiB, speedPosition)
-			if err != nil {
-				return err
-			}
-			runResults = append(runResults, benchmark)
-			m.mu.Lock()
-			job.Progress = float64(int64(i)*runs+run+1) / float64(int64(len(specs))*runs) * 100
-			m.mu.Unlock()
-		}
-		benchmark := combineBenchmarkRuns(spec, runResults)
-		benchmarks = append(benchmarks, benchmark)
-		m.mu.Lock()
-		job.Result = &speedInProgress{Benchmarks: benchmarks}
-		m.mu.Unlock()
-		m.persistSafe(job, "保存任务状态")
+	cancel := m.beginCancellation(job)
+	engine := "io_uring"
+	if job.Options.SpeedIOEngine != nil {
+		engine = *job.Options.SpeedIOEngine
+	}
+	specs := speedJobBenchmarks(job.Options.SpeedPreset, speedOperation, speedPattern, speedBlockSize, speedQueueDepth, speedThreadCount, writeAllowed, speedProfile, speedProfileRow, engine)
+	benchmarks, err := m.runSpeedRounds(cancel.ctx, job, specs, runs, func(spec benchmarkSpec) (BenchmarkResult, error) {
+		return m.mockBenchmark(job, spec, sampleMiB, speedPosition)
+	})
+	m.endCancellation(job, cancel)
+	if err != nil {
+		return err
+	}
+	if m.checkCancelled(job) != nil {
+		return errCancelled
 	}
 	result := &SpeedResult{SampleMiB: sampleMiB, Runs: runs, Benchmarks: benchmarks}
 	m.complete(job, result, "一键测速完成（演示）")
+	// Cancellation may have won the final race with completion.
+	m.mu.Lock()
+	cancelling := job.Status == "cancelling"
+	m.mu.Unlock()
+	if cancelling {
+		return errCancelled
+	}
 	return nil
 }
 
@@ -3303,7 +3343,6 @@ func (m *JobManager) mockBenchmark(job *Job, spec benchmarkSpec, sampleMiB int64
 		m.mu.Lock()
 		job.Phase = fmt.Sprintf("随机%s（%s Q%dT%d）", verb, formatBlockSize(spec.BlockSize), spec.QueueDepth, spec.Threads)
 		m.mu.Unlock()
-		m.delayFn(600 * time.Millisecond)
 		if err := m.checkCancelled(job); err != nil {
 			return BenchmarkResult{}, err
 		}
@@ -3322,11 +3361,19 @@ func (m *JobManager) mockBenchmark(job *Job, spec benchmarkSpec, sampleMiB int64
 				mbps = 156.0
 			}
 		}
-		bytes := sampleMiB * 1024 * 1024
-		seconds := float64(bytes) / (mbps * 1e6)
-		samples = append(samples, SpeedSample{Label: "随机", OffsetBytes: 0, Bytes: bytes, Seconds: seconds, MBps: mbps})
+		duration := speedRunSeconds(job)
+		seconds := float64(duration)
+		if err := m.mockSpeedFeedback(job, mbps, duration, 0); err != nil {
+			return BenchmarkResult{}, err
+		}
+		bytes := int64(mbps * 1e6 * seconds)
+		samples = append(samples, SpeedSample{Label: "随机", OffsetBytes: 0, RangeBytes: sampleMiB * 1024 * 1024, Bytes: bytes, Seconds: seconds, MBps: mbps})
 	} else {
-		plan, err := createSpeedPlan(job.Disk.Size, sampleMiB, speedPosition)
+		targetSize := job.Disk.Size
+		if job.StorageSpace != nil {
+			targetSize = sampleMiB * 1024 * 1024
+		}
+		plan, err := createSpeedPlan(targetSize, sampleMiB, speedPosition)
 		if err != nil {
 			return BenchmarkResult{}, err
 		}
@@ -3345,6 +3392,7 @@ func (m *JobManager) mockBenchmark(job *Job, spec benchmarkSpec, sampleMiB int64
 				demoSpeeds = map[string]float64{"start": 301, "middle": 280, "end": 256}
 			}
 		}
+		var elapsedBefore int64
 		for i, target := range plan.Targets {
 			if err := m.checkCancelled(job); err != nil {
 				return BenchmarkResult{}, err
@@ -3352,15 +3400,20 @@ func (m *JobManager) mockBenchmark(job *Job, spec benchmarkSpec, sampleMiB int64
 			m.mu.Lock()
 			job.Phase = fmt.Sprintf("%s位置顺序%s Q%dT%d（%d/%d）", target.Label, verb, spec.QueueDepth, spec.Threads, i+1, len(plan.Targets))
 			m.mu.Unlock()
-			m.delayFn(350 * time.Millisecond)
 			if err := m.checkCancelled(job); err != nil {
 				return BenchmarkResult{}, err
 			}
 			mbps := demoSpeeds[target.ID]
-			bytes := target.BlockCount * speedBlockSize
+			duration := splitSpeedSeconds(speedRunSeconds(job), i, len(plan.Targets))
+			if err := m.mockSpeedFeedback(job, mbps, duration, elapsedBefore); err != nil {
+				return BenchmarkResult{}, err
+			}
+			elapsedBefore += duration
+			bytes := int64(mbps * 1e6 * float64(duration))
 			samples = append(samples, SpeedSample{
 				Label:       target.Label,
 				OffsetBytes: target.OffsetBlocks * speedBlockSize,
+				RangeBytes:  target.BlockCount * speedBlockSize,
 				Bytes:       bytes,
 				Seconds:     float64(bytes) / (mbps * 1e6),
 				MBps:        mbps,
@@ -3463,26 +3516,12 @@ func (m *JobManager) runSpeed(job *Job, sampleMiB, runs int64, speedPosition, sp
 	if fioPath == "" {
 		return newJobError("系统未找到 fio，无法执行磁盘测速", "CAPABILITY_UNAVAILABLE", 503)
 	}
-	specs := selectSpeedBenchmarks(speedOperation, speedPattern, speedBlockSize, speedQueueDepth, speedThreadCount, writeAllowed, speedProfile, speedProfileRow)
-	var benchmarks []BenchmarkResult
-	for i, spec := range specs {
-		var runResults []BenchmarkResult
-		for run := int64(0); run < runs; run++ {
-			benchmark, err := m.runFioBenchmark(fioPath, benchmarkPath, job, cancel.ctx, spec, sampleMiB, speedPosition, benchmarkSize, targetSize, ioEngine, directIO)
-			if err != nil {
-				return err
-			}
-			runResults = append(runResults, benchmark)
-			m.mu.Lock()
-			job.Progress = float64(int64(i)*runs+run+1) / float64(int64(len(specs))*runs) * 100
-			m.mu.Unlock()
-		}
-		benchmark := combineBenchmarkRuns(spec, runResults)
-		benchmarks = append(benchmarks, benchmark)
-		m.mu.Lock()
-		job.Result = &speedInProgress{Benchmarks: benchmarks}
-		m.mu.Unlock()
-		m.persistSafe(job, "保存任务状态")
+	specs := speedJobBenchmarks(job.Options.SpeedPreset, speedOperation, speedPattern, speedBlockSize, speedQueueDepth, speedThreadCount, writeAllowed, speedProfile, speedProfileRow, ioEngine)
+	benchmarks, err := m.runSpeedRounds(cancel.ctx, job, specs, runs, func(spec benchmarkSpec) (BenchmarkResult, error) {
+		return m.runFioBenchmark(fioPath, benchmarkPath, job, cancel.ctx, spec, sampleMiB, speedPosition, benchmarkSize, targetSize, ioEngine, directIO)
+	})
+	if err != nil {
+		return err
 	}
 	result := &SpeedResult{SampleMiB: sampleMiB, Runs: runs, Benchmarks: benchmarks}
 	m.complete(job, result, "一键测速完成")
@@ -3495,8 +3534,10 @@ type fioIOStats struct {
 }
 
 type fioJobResult struct {
-	Read  fioIOStats `json:"read"`
-	Write fioIOStats `json:"write"`
+	Error      int        `json:"error"`
+	JobRuntime float64    `json:"job_runtime"`
+	Read       fioIOStats `json:"read"`
+	Write      fioIOStats `json:"write"`
 }
 
 type fioOutput struct {
@@ -3511,6 +3552,9 @@ func parseFioSample(output []byte, label string, offset int64) (SpeedSample, err
 	var bytesTransferred int64
 	var runtimeMs float64
 	for _, fioJob := range result.Jobs {
+		if fioJob.Error != 0 {
+			return SpeedSample{}, fmt.Errorf("fio I/O 失败（错误码 %d）", fioJob.Error)
+		}
 		bytesTransferred += fioJob.Read.IOBytes + fioJob.Write.IOBytes
 		if fioJob.Read.Runtime > runtimeMs {
 			runtimeMs = fioJob.Read.Runtime
@@ -3555,7 +3599,7 @@ func conciseCommandError(prefix string, err error, stderr string) error {
 	return fmt.Errorf("%s：%s", prefix, message)
 }
 
-func (m *JobManager) runFioSample(fioPath, temporaryPath string, job *Job, cancelContext context.Context, spec benchmarkSpec, label string, offset, length int64, ioEngine string, directIO bool) (SpeedSample, error) {
+func (m *JobManager) runFioSample(fioPath, temporaryPath string, job *Job, cancelContext context.Context, spec benchmarkSpec, label string, offset, length int64, ioEngine string, directIO bool, durationSeconds, elapsedBefore int64) (SpeedSample, error) {
 	if job.StorageSpace == nil {
 		current, err := m.assertRawSpeedIdentity(job)
 		if err != nil {
@@ -3581,9 +3625,10 @@ func (m *JobManager) runFioSample(fioPath, temporaryPath string, job *Job, cance
 		"--size=" + strconv.FormatInt(perJobSize, 10), "--offset=" + strconv.FormatInt(offset, 10),
 		"--offset_increment=" + strconv.FormatInt(perJobSize, 10),
 		"--create_on_open=0", "--allow_file_create=0", "--fallocate=none", "--thread=1", "--eta=never", "--output-format=json",
+		"--time_based=1", "--runtime=" + strconv.FormatInt(durationSeconds, 10) + "s", "--status-interval=1",
 	}
 	if spec.Operation == "mixed" {
-		args = append(args, "--rwmixread=70")
+		args = append(args, "--rwmixread=50")
 	}
 	if spec.Pattern == "random" {
 		args = append(args, "--randrepeat=0", "--norandommap=1")
@@ -3592,18 +3637,9 @@ func (m *JobManager) runFioSample(fioPath, temporaryPath string, job *Job, cance
 		args = append(args, "--end_fsync=1")
 	}
 
-	command := exec.CommandContext(cancelContext, fioPath, args...)
-	command.Env = append(os.Environ(), "LC_ALL=C")
-	var stderr bytes.Buffer
-	command.Stderr = &stderr
-	output, err := command.Output()
-	if cancelContext.Err() != nil || m.checkCancelled(job) != nil {
-		return SpeedSample{}, errCancelled
-	}
-	if err != nil {
-		return SpeedSample{}, conciseCommandError("fio 测速失败", err, stderr.String())
-	}
-	return parseFioSample(output, label, offset)
+	sample, err := m.streamFioSample(cancelContext, fioPath, args, job, label, offset, durationSeconds, elapsedBefore)
+	sample.RangeBytes = perJobSize * spec.Threads
+	return sample, err
 }
 
 func (m *JobManager) runFioBenchmark(fioPath, benchmarkPath string, job *Job, cancelContext context.Context, spec benchmarkSpec, sampleMiB int64, speedPosition string, benchmarkSize, targetSize int64, ioEngine string, directIO bool) (BenchmarkResult, error) {
@@ -3620,7 +3656,7 @@ func (m *JobManager) runFioBenchmark(fioPath, benchmarkPath string, job *Job, ca
 		job.Phase = fmt.Sprintf("随机%s（%s Q%dT%d）", benchmarkOperationLabel(spec.Operation), formatBlockSize(spec.BlockSize), spec.QueueDepth, spec.Threads)
 		m.mu.Unlock()
 		m.persistSafe(job, "保存任务状态")
-		sample, err := m.runFioSample(fioPath, benchmarkPath, job, cancelContext, spec, "随机", 0, benchmarkSize, ioEngine, directIO)
+		sample, err := m.runFioSample(fioPath, benchmarkPath, job, cancelContext, spec, "随机", 0, benchmarkSize, ioEngine, directIO, speedRunSeconds(job), 0)
 		if err != nil {
 			return BenchmarkResult{}, err
 		}
@@ -3630,18 +3666,21 @@ func (m *JobManager) runFioBenchmark(fioPath, benchmarkPath string, job *Job, ca
 		if err != nil {
 			return BenchmarkResult{}, err
 		}
+		var elapsedBefore int64
 		for index, target := range plan.Targets {
+			duration := splitSpeedSeconds(speedRunSeconds(job), index, len(plan.Targets))
 			m.mu.Lock()
 			job.Phase = fmt.Sprintf("%s位置顺序%s Q%dT%d（%d/%d）", target.Label, benchmarkOperationLabel(spec.Operation), spec.QueueDepth, spec.Threads, index+1, len(plan.Targets))
 			m.mu.Unlock()
 			m.persistSafe(job, "保存任务状态")
 			offset := target.OffsetBlocks * speedBlockSize
 			length := target.BlockCount * speedBlockSize
-			sample, err := m.runFioSample(fioPath, benchmarkPath, job, cancelContext, spec, target.Label, offset, length, ioEngine, directIO)
+			sample, err := m.runFioSample(fioPath, benchmarkPath, job, cancelContext, spec, target.Label, offset, length, ioEngine, directIO, duration, elapsedBefore)
 			if err != nil {
 				return BenchmarkResult{}, err
 			}
 			samples = append(samples, sample)
+			elapsedBefore += duration
 		}
 	}
 
@@ -3770,11 +3809,18 @@ func syncBenchmark(handle WriteHandle) error {
 func (m *JobManager) prepareBenchmarkFile(handle WriteHandle, job *Job, size int64) error {
 	buffer, release := allocateAligned(speedBlockSize)
 	defer release()
-	fillPattern(buffer, writePatternA)
+	if err := speedFilePattern(job, buffer); err != nil {
+		return fmt.Errorf("无法生成测速文件内容：%w", err)
+	}
 	m.mu.Lock()
 	job.Phase = "准备测速临时文件"
+	job.SpeedLive = &SpeedLiveStatus{Stage: "preparing", TotalBytes: size}
 	m.mu.Unlock()
 	m.persistSafe(job, "保存任务状态")
+	started := time.Now()
+	stopClock := m.trackSpeedPreparationTime(job, started)
+	defer stopClock()
+	lastUpdate := started
 	for offset := int64(0); offset < size; offset += int64(len(buffer)) {
 		length := int64(len(buffer))
 		if remaining := size - offset; remaining < length {
@@ -3783,8 +3829,21 @@ func (m *JobManager) prepareBenchmarkFile(handle WriteHandle, job *Job, size int
 		if err := m.benchmarkWrite(handle, buffer[:length], offset, job); err != nil {
 			return err
 		}
+		if time.Since(lastUpdate) >= time.Second || offset+length == size {
+			m.mu.Lock()
+			job.SpeedLive.Bytes = offset + length
+			job.SpeedLive.ElapsedSeconds = time.Since(started).Seconds()
+			job.Progress = 5 * float64(offset+length) / float64(size)
+			m.mu.Unlock()
+			lastUpdate = time.Now()
+		}
 	}
-	return syncBenchmark(handle)
+	m.mu.Lock()
+	job.Phase = "测试文件已写入，等待落盘"
+	job.SpeedLive.Stage = "preparing-sync"
+	m.mu.Unlock()
+	_, err := awaitCancelable(m, job, func() (int, error) { return 0, syncBenchmark(handle) })
+	return err
 }
 
 func (m *JobManager) benchmarkRead(handle WriteHandle, buffer []byte, pos int64, job *Job) error {
@@ -3846,8 +3905,7 @@ func benchmarkRequestWrites(operation string, index int64) bool {
 	if operation == "write" {
 		return true
 	}
-	// Match CrystalDiskMark's mixed profile: 70% reads and 30% writes.
-	return operation == "mixed" && index%10 >= 7
+	return operation == "mixed" && index%2 == 1
 }
 
 func (m *JobManager) runConcurrentBenchmarkIO(handle WriteHandle, job *Job, blockSize, queueDepth int64, requests []benchmarkIORequest) error {

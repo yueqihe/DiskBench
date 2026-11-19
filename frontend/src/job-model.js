@@ -751,13 +751,46 @@ export function activeJobForTarget(jobs, mode, disk, speedTarget) {
       : ["scan", "write"].includes(job.type) && jobBelongsToDisk(job, disk))) || null;
 }
 
-export function taskStartBlockedReason(jobs, mode, disk) {
+function sameTaskDisk(firstPath, firstSerial, secondPath, secondSerial) {
+  return (Boolean(firstPath) && firstPath === secondPath)
+    || (Boolean(text(firstSerial)) && text(firstSerial) === text(secondSerial));
+}
+
+const taskDiskPath = /^\/dev\/[A-Za-z0-9._+\-]+$/;
+
+function speedScanConflict(speed, scan) {
+  const overlap = "测速目标与坏道扫描使用同一块硬盘，请等待任务结束";
+  const unknown = "无法确认测速目标的物理硬盘，暂不能与坏道扫描同时运行";
+  if (!speed.storageSpace) {
+    if (!taskDiskPath.test(speed.device)) return unknown;
+    return sameTaskDisk(speed.device, speed.disk?.serial, scan.device, scan.disk?.serial) ? overlap : "";
+  }
+  const { members } = speed.storageSpace;
+  if (!Array.isArray(members) || !members.length || members.some(member => !taskDiskPath.test(member))) return unknown;
+  const memberDisks = speed.memberDisks ?? speed.storageSpace.memberDisks;
+  return members.includes(scan.device) || (Array.isArray(memberDisks) && memberDisks.some(member =>
+    sameTaskDisk("", member?.serial, scan.device, scan.disk?.serial))) ? overlap : "";
+}
+
+export function taskStartBlockedReason(jobs, mode, disk, speedTarget) {
   const active = (Array.isArray(jobs) ? jobs : []).filter(job => ACTIVE_JOB_STATUSES.has(job?.status));
-  if (mode === "speed") return active.length ? "测速需等待其他检测任务结束" : "";
-  if (active.some(job => job.type !== "scan")) return "请等待测速或其他检测任务结束后再扫描";
-  if (active.some(job => job.device === disk?.path
-    || (text(job.disk?.serial) && text(job.disk?.serial) === text(disk?.serial)))) {
-    return "这块硬盘已有任务运行或正在停止，请等待任务结束";
+  if (mode === "speed" && active.some(job => job.type === "speed")) {
+    return "一次只能运行一个测速任务，请等待当前测速结束";
+  }
+  const candidate = mode === "speed"
+    ? speedTarget && { ...speedTarget, device: speedTarget.disk?.path || speedTarget.path }
+    : disk && { device: disk.path, disk };
+  if (!candidate) return "";
+  for (const job of active) {
+    if (job.type !== "scan" && job.type !== "speed") return "请等待其他检测任务结束";
+    if (mode === "scan" && job.type === "scan") {
+      if (sameTaskDisk(candidate.device, disk.serial, job.device, job.disk?.serial)) {
+        return "这块硬盘已有任务运行或正在停止，请等待任务结束";
+      }
+    } else {
+      const conflict = mode === "speed" ? speedScanConflict(candidate, job) : speedScanConflict(job, candidate);
+      if (conflict) return conflict;
+    }
   }
   return "";
 }
@@ -896,6 +929,47 @@ export function isCompleteScanResult(job) {
   return true;
 }
 
+// Saved physical members remain authoritative after a disk is removed/replaced.
+export function jobDiskModel(job, disks = [], storageSpaces = []) {
+  if (!job?.storageSpace) {
+    const model = text(job?.disk?.model).trim() || "未知型号";
+    return { text: model, tooltip: model, current: false };
+  }
+  const saved = job.storageSpace;
+  const format = (members) => {
+    const counts = new Map();
+    for (const disk of members) {
+      const model = text(disk?.model).trim() || "型号未记录";
+      counts.set(model, (counts.get(model) || 0) + 1);
+    }
+    return [...counts].map(([model, count]) => count > 1 ? `${model} ×${count}` : model).join(" / ");
+  };
+  const fs = text(saved.fileSystem).toUpperCase();
+  if (Array.isArray(saved.memberDisks) && saved.memberDisks.length) {
+    const model = format(saved.memberDisks);
+    return { text: model, tooltip: [model, fs].filter(Boolean).join(" · "), current: false };
+  }
+  const sameMembers = (a, b) => Array.isArray(a) && Array.isArray(b) && a.length > 0
+    && a.length === b.length && [...a].sort().every((member, index) => member === [...b].sort()[index]);
+  const currentSpace = storageSpaces.find(space => space.path === saved.path && space.source === saved.source
+    && space.fileSystem === saved.fileSystem && space.layout === saved.layout && sameMembers(space.members, saved.members));
+  const currentDisks = currentSpace?.members.map(member => disks.find(disk => disk.path === member));
+  if (currentDisks?.length && currentDisks.every(disk => disk && text(disk.model).trim())) {
+    const model = format(currentDisks);
+    return { text: `当前：${model}`, tooltip: `旧记录未保存硬盘型号，此处来自当前存储空间成员，不能确认是当时的硬盘。\n${model}${fs ? ` · ${fs}` : ""}`, current: true };
+  }
+  return { text: "型号未记录", tooltip: ["旧记录未保存硬盘型号", fs].filter(Boolean).join(" · "), current: false };
+}
+
+export const CRYSTAL_SPEED_PRESET = "crystal-all";
+const LEGACY_CRYSTAL_SPEED_PRESET = "crystal-default";
+export const CRYSTAL_SPEED_RUNS = 3;
+export const CRYSTAL_SPEED_SIZES = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536];
+
+export function isCrystalSpeedPreset(preset) {
+  return preset === CRYSTAL_SPEED_PRESET || preset === LEGACY_CRYSTAL_SPEED_PRESET;
+}
+
 export function speedHistorySummary(job) {
   if (job?.type !== "speed") return null;
   const results = Array.isArray(job.result?.benchmarks) ? job.result.benchmarks : job.speedSummary?.benchmarks;
@@ -920,20 +994,23 @@ export function speedHistorySummary(job) {
   return { text, tooltip: details.join("\n") };
 }
 
-export function speedBenchmarkCells(job, rows) {
+export function speedBenchmarkCells(job, rows, operations = ["read", "write", "mixed"]) {
   const options = job.options || {};
-  const cells = rows.flatMap((row) => ["read", "write", "mixed"].map((operation) => ({
+  const crystal = isCrystalSpeedPreset(options.speedPreset);
+  const cells = rows.flatMap((row) => operations.map((operation) => ({
     row, operation, benchmark: null, active: false,
     skipped: (Boolean(options.speedPattern) && options.speedPattern !== row.pattern)
       || (["read", "write", "mixed"].includes(options.speedOperation) && options.speedOperation !== operation)
+      || (options.speedPreset === LEGACY_CRYSTAL_SPEED_PRESET && !options.speedOperation && operation === "mixed")
       || (Boolean(options.speedProfileRow) && options.speedProfileRow !== row.profileRow)
-      || (options.speedProfile !== true && [
+      || (!crystal && options.speedProfile !== true && [
         [options.speedBlockSize, row.blockSize], [options.speedQueueDepth, row.queueDepth], [options.speedThreads, row.threads]
       ].some(([filter, value]) => filter > 0 && filter !== value))
   })));
   // Results arrive in execution order. Consume each once: Q1T1 profile rows
   // can share every I/O parameter but must retain separate results and states.
-  for (const benchmark of Array.isArray(job.result?.benchmarks) ? job.result.benchmarks : []) {
+  const benchmarks = Array.isArray(job.result?.benchmarks) ? job.result.benchmarks : job.speedSummary?.benchmarks;
+  for (const benchmark of Array.isArray(benchmarks) ? benchmarks : []) {
     if (!record(benchmark) || !Number.isFinite(benchmark.averageMBps)) continue;
     const cell = cells.find(({ row, operation, skipped, benchmark: assigned }) => !skipped && !assigned
       && benchmark.operation === operation && benchmark.pattern === row.pattern
@@ -942,7 +1019,19 @@ export function speedBenchmarkCells(job, rows) {
       && (benchmark.threads ?? 1) === row.threads);
     if (cell) cell.benchmark = benchmark;
   }
-  const next = cells.find((cell) => !cell.skipped && !cell.benchmark);
+  const pendingOrder = crystal
+    ? operations.flatMap(operation => cells.filter(cell => cell.operation === operation && !cell.skipped))
+    : cells.filter(cell => !cell.skipped);
+  const next = pendingOrder.find((cell) => !cell.benchmark);
+  if (crystal) {
+    const current = job.speedLive;
+    const active = pendingOrder[current?.benchmarkIndex];
+    if (job.type === "speed" && job.status === "running" && active && !active.benchmark && ["running", "finishing"].includes(current.stage)) {
+      active.active = true;
+      active.live = current;
+    }
+    return cells;
+  }
   const phase = text(job.phase);
   const stage = /^(随机|(?:头部|中部|尾部)位置顺序)(混合读写|读取|写入)/.exec(phase);
   const parameters = /Q(\d+)T(\d+)/.exec(phase);
@@ -952,6 +1041,10 @@ export function speedBenchmarkCells(job, rows) {
     next.active = next.row.pattern === (stage[1] === "随机" ? "random" : "sequential")
       && next.operation === ({ 读取: "read", 写入: "write", 混合读写: "mixed" })[stage[2]]
       && next.row.queueDepth === Number(parameters[1]) && next.row.threads === Number(parameters[2]);
+  }
+  if (next?.active && ["running", "finishing"].includes(job.speedLive?.stage)) {
+    const index = pendingOrder.indexOf(next);
+    if (job.speedLive.benchmarkIndex === index) next.live = job.speedLive;
   }
   return cells;
 }
@@ -969,7 +1062,7 @@ export function isCompleteSpeedResult(job) {
     || targetSize <= 0
     || !Number.isSafeInteger(job.result.sampleMiB)
     || job.result.sampleMiB < 0
-    || (job.result.runs !== undefined && ![1, 3, 5].includes(job.result.runs))) {
+    || (job.result.runs !== undefined && (!Number.isSafeInteger(job.result.runs) || job.result.runs < 1 || job.result.runs > 9))) {
     return false;
   }
 
@@ -1008,10 +1101,14 @@ export function isCompleteSpeedResult(job) {
 
     const sorted = [...samples].sort((first, second) => first.offsetBytes - second.offsetBytes);
     if (sorted.some((sample, index) => {
-      const end = sample.offsetBytes + sample.bytes;
-      return !Number.isSafeInteger(end)
+      // Timed tests may revisit their range; transferred bytes are not its length.
+      const length = sample.rangeBytes ?? sample.bytes;
+      const end = sample.offsetBytes + length;
+      const previous = sorted[index - 1];
+      return !Number.isSafeInteger(length) || length <= 0
+        || !Number.isSafeInteger(end)
         || end > targetSize
-        || (index > 0 && sorted[index - 1].offsetBytes + sorted[index - 1].bytes > sample.offsetBytes);
+        || (index > 0 && previous.offsetBytes + (previous.rangeBytes ?? previous.bytes) > sample.offsetBytes);
     })) {
       return false;
     }

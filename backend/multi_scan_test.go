@@ -241,13 +241,58 @@ func TestScanAdmissionRetainsResourcesAfterTerminalStatus(t *testing.T) {
 	m.endCancellation(job, cancel)
 }
 
-func TestScanAdmissionRejectsSameSerialAtAnotherPathAndActiveSpeed(t *testing.T) {
+func TestScanAdmissionRejectsSameSerialAtAnotherPath(t *testing.T) {
 	m := &JobManager{jobs: map[string]*Job{
 		"running": {ID: "running", Type: "scan", Device: "/dev/sda", Disk: DiskSnapshot{Serial: "same-physical-disk"}, Status: "running"},
 	}}
 	candidate := &Job{Type: "scan", Device: "/dev/sdz", Disk: DiskSnapshot{Serial: "same-physical-disk"}}
 	requireJobConflict(t, m.jobAdmissionErrorLocked(candidate))
-	m.jobs["running"].Type = "speed"
-	candidate.Disk.Serial = "another-disk"
-	requireJobConflict(t, m.jobAdmissionErrorLocked(candidate))
+}
+
+func TestScanAndSpeedAdmissionByPhysicalDisk(t *testing.T) {
+	scan := &Job{ID: "scan", Type: "scan", Status: "running", Device: "/dev/sdb", Disk: DiskSnapshot{Serial: "B"}}
+	for _, tc := range []struct {
+		name     string
+		device   string
+		serial   string
+		space    *StorageSpaceSnapshot
+		conflict bool
+	}{
+		{name: "raw same path", device: "/dev/sdb", conflict: true},
+		{name: "raw same serial", device: "/dev/sdz", serial: "B", conflict: true},
+		{name: "raw other disk", device: "/dev/sdc", serial: "C"},
+		{name: "array second member", device: "/vol1", space: &StorageSpaceSnapshot{Members: []string{"/dev/sda", "/dev/sdb"}}, conflict: true},
+		{name: "array member by serial", device: "/vol1", space: &StorageSpaceSnapshot{Members: []string{"/dev/sda", "/dev/sdz"}, MemberDisks: []DiskSnapshot{{Serial: "A"}, {Serial: "B"}}}, conflict: true},
+		{name: "array other disks", device: "/vol1", space: &StorageSpaceSnapshot{Members: []string{"/dev/sda", "/dev/sdc"}}},
+		{name: "system disk", device: "/tmp", space: &StorageSpaceSnapshot{Members: []string{"/dev/sdb"}, IsSystem: true}, conflict: true},
+		{name: "unresolved members", device: "/vol1", space: &StorageSpaceSnapshot{}, conflict: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			speed := &Job{ID: "speed", Type: "speed", Status: "running", Device: tc.device, Disk: DiskSnapshot{Serial: tc.serial}, StorageSpace: tc.space}
+			for _, pair := range [][2]*Job{{scan, speed}, {speed, scan}} {
+				current, candidate := pair[0], pair[1]
+				m := &JobManager{jobs: map[string]*Job{current.ID: current}}
+				err := m.jobAdmissionErrorLocked(candidate)
+				if tc.conflict {
+					requireJobConflict(t, err)
+				} else if err != nil {
+					t.Fatalf("%s after %s should start: %v", candidate.Type, current.Type, err)
+				}
+			}
+		})
+	}
+}
+
+func TestSpeedAdmissionDoesNotDependOnTarget(t *testing.T) {
+	current := &Job{ID: "first", Type: "speed", Device: "/vol1"}
+	m := &JobManager{jobs: map[string]*Job{current.ID: current}}
+	candidate := &Job{Type: "speed", Device: "/dev/sdb"}
+	for _, status := range []string{"queued", "running", "cancelling"} {
+		current.Status = status
+		requireJobConflict(t, m.jobAdmissionErrorLocked(candidate))
+	}
+	current.Status = "completed"
+	if err := m.jobAdmissionErrorLocked(candidate); err != nil {
+		t.Fatalf("finished benchmark still blocks another target: %v", err)
+	}
 }

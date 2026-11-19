@@ -59,8 +59,11 @@ import {
   scanStatusGroup,
   speedBenchmarkCells,
   speedHistorySummary,
-  speedTargetDefaults,
-  storageSpaceUsesOnlySolidStateDisks,
+  jobDiskModel,
+  isCrystalSpeedPreset,
+  CRYSTAL_SPEED_PRESET,
+  CRYSTAL_SPEED_RUNS,
+  CRYSTAL_SPEED_SIZES,
   storageSpaceLabel,
   storageSpacesForDisk,
   terminalScanPrefix,
@@ -619,20 +622,7 @@ function TaskSetup({ mode, scanMode, setScanMode, scanExactSectors, setScanExact
       : (health?.capabilities?.fstrim === true ? "测速前对所选存储空间执行 TRIM" : "系统未提供 fstrim"));
   const actionLabel = activeJob ? (stopping ? "正在停止" : "停止任务") : (checkingResume ? "正在检查扫描记录" : startLabel);
   const startOptions = mode === "speed"
-    ? {
-        type: "speed",
-        speedRuns: speedConfig.speedRuns,
-        sampleMiB: speedConfig.sampleMiB,
-        speedPosition: "all",
-        speedBlockSize: speedConfig.speedBlockSize,
-        speedQueueDepth: speedConfig.speedIOEngine === "psync" ? 1 : speedConfig.speedQueueDepth,
-        speedThreads: speedConfig.speedThreads,
-        speedIOEngine: speedConfig.speedIOEngine,
-        speedDirectIO: speedConfig.speedDirectIO,
-        speedTrim: speedTarget?.type === "raw" ? false : speedConfig.speedTrim,
-        speedProfile: true,
-        ...(speedConfig.speedOperation !== "auto" ? { speedOperation: speedConfig.speedOperation } : {})
-      }
+    ? speedRunOptions(speedConfig)
     : { type: "scan", scanMode, scanExactSectors, scanDeepLocate, scanRepair: repairEnabled, ...(repairEnabled ? { scanRepairAfterMs: Number(scanRepairAfterMs) } : {}), scanSelfTest: scanSelfTest && /^\/dev\/nvme\d+(?:c\d+)?n\d+$/.test(disk?.path || "") && !health?.capabilities?.mock };
   const actionDisabled = activeJob
     ? stopping
@@ -752,18 +742,18 @@ function TaskSetup({ mode, scanMode, setScanMode, scanExactSectors, setScanExact
         {mode === "speed" && (
           <div className="speed-config-stack">
             <div className="speed-sidebar-config">
-              <label><span>测试次数</span><Select aria-label="测试次数" value={speedConfig.speedRuns} onValueChange={value => setSpeedConfig(current => ({ ...current, speedRuns: Number(value) }))} options={[1, 3, 5].map(value => ({ value, label: `${value} 次` }))} /></label>
-              <label><span>每项样本</span><Select aria-label="每项样本" value={speedConfig.sampleMiB} onValueChange={value => setSpeedConfig(current => ({ ...current, sampleMiB: Number(value) }))} options={[{ value: 256, label: "256 MiB" }, { value: 1024, label: "1 GiB" }, { value: 4096, label: "4 GiB" }]} /></label>
-              <label><span>测试组合</span><Select aria-label="测试组合" value={speedConfig.speedOperation} onValueChange={value => setSpeedConfig(current => ({ ...current, speedOperation: value }))} options={[{ value: "auto", label: "全部" }, { value: "read", label: "读取" }, { value: "write", label: "写入" }, { value: "mixed", label: "混合 70/30" }]} /></label>
-              <label><span>块大小</span><Select aria-label="块大小" value={speedConfig.speedBlockSize} onValueChange={value => setSpeedConfig(current => ({ ...current, speedBlockSize: Number(value) }))} options={[{ value: 4096, label: "4 KiB" }, { value: 65536, label: "64 KiB" }, { value: 1048576, label: "1 MiB" }, { value: 4194304, label: "4 MiB" }]} /></label>
-              <label data-tooltip={speedConfig.speedIOEngine === "psync" ? "psync 使用同步 I/O，队列深度固定为 1" : "同时提交的 I/O 请求数；高队列项目使用该值"}><span>队列深度</span><Select aria-label="队列深度" value={speedConfig.speedIOEngine === "psync" ? 1 : speedConfig.speedQueueDepth} disabled={speedConfig.speedIOEngine === "psync"} onValueChange={value => setSpeedConfig(current => ({ ...current, speedQueueDepth: Number(value) }))} options={[1, 8, 16, 32, 64, 128].map(value => ({ value, label: String(value) }))} /></label>
-              <label><span>并发任务</span><Select aria-label="并发任务" value={speedConfig.speedThreads} onValueChange={value => setSpeedConfig(current => ({ ...current, speedThreads: Number(value) }))} options={[1, 2, 4, 8].map(value => ({ value, label: String(value) }))} /></label>
+              <label><span data-tooltip="正式测试重复执行，取最快一次的平均速度。">测试次数</span><Select aria-label="测试次数" value={speedConfig.speedRuns} onValueChange={value => setSpeedConfig(current => ({ ...current, speedRuns: Number(value) }))} options={Array.from({ length: 9 }, (_, index) => ({ value: index + 1, label: `${index + 1} 次` }))} /></label>
+              <label><span data-tooltip="指定测试文件大小或裸盘访问范围，可在范围内重复读写。">测试范围</span><Select aria-label="测试范围" value={speedConfig.sampleMiB} onValueChange={value => setSpeedConfig(current => ({ ...current, sampleMiB: Number(value) }))} options={CRYSTAL_SPEED_SIZES.map(value => ({ value, label: formatBinaryBytes(value * 1048576) }))} /></label>
+              <label><span>测试组合</span><Select aria-label="测试组合" value={speedConfig.speedOperation} onValueChange={value => setSpeedConfig(current => ({ ...current, speedOperation: value }))} options={[{ value: "auto", label: "全部" }, { value: "read", label: "读取" }, { value: "write", label: "写入" }, { value: "mixed", label: "混合 50/50" }]} /></label>
+              <label><span data-tooltip="设置顺序测试块大小，随机测试固定使用 4 KiB">块大小</span><Select aria-label="块大小" value={speedConfig.speedBlockSize} onValueChange={value => setSpeedConfig(current => ({ ...current, speedBlockSize: Number(value) }))} options={[4096, 65536, 1048576, 4194304].map(value => ({ value, label: formatBinaryBytes(value) }))} /></label>
+              <label><span data-tooltip="仅调整高队列项目；按项目使用顺序 Q8、随机 Q32">队列深度</span><Select aria-label="队列深度" value={speedConfig.speedIOEngine === "psync" ? 1 : speedConfig.speedQueueDepth} disabled={speedConfig.speedIOEngine === "psync"} onValueChange={value => setSpeedConfig(current => ({ ...current, speedQueueDepth: Number(value) }))} options={[{ value: 0, label: "按项目" }, ...[1, 8, 16, 32, 64, 128].map(value => ({ value, label: String(value) }))]} /></label>
+              <label><span data-tooltip="仅调整高队列项目；Q1T1 基准固定为单任务">并发任务</span><Select aria-label="并发任务" value={speedConfig.speedIOEngine === "psync" ? 1 : speedConfig.speedThreads} disabled={speedConfig.speedIOEngine === "psync"} onValueChange={value => setSpeedConfig(current => ({ ...current, speedThreads: Number(value) }))} options={[1, 2, 4, 8].map(value => ({ value, label: String(value) }))} /></label>
             </div>
             <div className="speed-engine-row">
               <span id="speed-engine-label">I/O 引擎</span>
               <div className="segmented speed-engine-options" role="group" aria-labelledby="speed-engine-label">
-                <button type="button" className={speedConfig.speedIOEngine === "io_uring" ? "active" : ""} aria-pressed={speedConfig.speedIOEngine === "io_uring"} onClick={() => setSpeedConfig(current => ({ ...current, speedIOEngine: "io_uring", speedQueueDepth: Math.max(8, current.speedQueueDepth) }))}>io_uring</button>
-                <button type="button" className={speedConfig.speedIOEngine === "psync" ? "active" : ""} aria-pressed={speedConfig.speedIOEngine === "psync"} onClick={() => setSpeedConfig(current => ({ ...current, speedIOEngine: "psync", speedQueueDepth: 1 }))}>psync</button>
+                <button type="button" className={speedConfig.speedIOEngine === "io_uring" ? "active" : ""} aria-pressed={speedConfig.speedIOEngine === "io_uring"} onClick={() => setSpeedConfig(current => ({ ...current, speedIOEngine: "io_uring" }))}>io_uring</button>
+                <button type="button" data-tooltip="同步 I/O 只执行 Q1 项目" className={speedConfig.speedIOEngine === "psync" ? "active" : ""} aria-pressed={speedConfig.speedIOEngine === "psync"} onClick={() => setSpeedConfig(current => ({ ...current, speedIOEngine: "psync" }))}>psync</button>
               </div>
             </div>
             <fieldset className="speed-extra-options">
@@ -1528,17 +1518,28 @@ function speedBlockCode(blockSize) {
   return ({ 4096: "4K", 65536: "64K", 1048576: "1M", 4194304: "4M" })[blockSize] || "1M";
 }
 
-function configuredSpeedRows(config) {
+function configuredSpeedRows(config, crystal = false) {
   const blockSize = [4096, 65536, 1048576, 4194304].includes(config.speedBlockSize) ? config.speedBlockSize : 1048576;
   const queueDepth = config.speedIOEngine === "psync" ? 1 : ([1, 8, 16, 32, 64, 128].includes(config.speedQueueDepth) ? config.speedQueueDepth : 8);
   const threads = [1, 2, 4, 8].includes(config.speedThreads) ? config.speedThreads : 1;
+  const randomDepth = crystal && !config.speedQueueDepth ? 32 : queueDepth;
   const seqCode = `SEQ${speedBlockCode(blockSize)}`;
   return [
     { key: `seq-q${queueDepth}t${threads}`, profileRow: "seq-high", pattern: "sequential", blockSize, queueDepth, threads, code: seqCode, subcode: `Q${queueDepth}T${threads}`, title: `${seqCode} Q${queueDepth}T${threads}` },
     { key: `seq-q1t1-${blockSize}`, profileRow: "seq-low", pattern: "sequential", blockSize, queueDepth: 1, threads: 1, code: seqCode, subcode: "Q1T1", title: `${seqCode} Q1T1` },
-    { key: `rnd-q${queueDepth}t${threads}-high`, profileRow: "rnd-high", pattern: "random", blockSize: 4096, queueDepth, threads, code: "RND4K", subcode: `Q${queueDepth}T${threads}`, title: `RND4K Q${queueDepth}T${threads}` },
+    { key: `rnd-q${randomDepth}t${threads}-high`, profileRow: "rnd-high", pattern: "random", blockSize: 4096, queueDepth: randomDepth, threads, code: "RND4K", subcode: `Q${randomDepth}T${threads}`, title: `RND4K Q${randomDepth}T${threads}` },
     { key: "rnd-q1t1-base", profileRow: "rnd-low", pattern: "random", blockSize: 4096, queueDepth: 1, threads: 1, code: "RND4K", subcode: "Q1T1", title: "RND4K Q1T1" }
   ];
+}
+
+function speedRunOptions(config) {
+  const { speedRuns, sampleMiB, speedIOEngine, speedDirectIO, speedTrim, speedBlockSize, speedQueueDepth, speedThreads, speedOperation } = config;
+  return {
+    type: "speed", speedPreset: CRYSTAL_SPEED_PRESET, speedRuns, sampleMiB, speedIOEngine, speedDirectIO, speedTrim, speedBlockSize,
+    ...(speedIOEngine !== "psync" && speedQueueDepth ? { speedQueueDepth } : {}),
+    ...(speedIOEngine !== "psync" ? { speedThreads } : {}),
+    ...(speedOperation !== "auto" ? { speedOperation } : {})
+  };
 }
 
 const SPEED_COLUMNS = [
@@ -1557,43 +1558,23 @@ function benchmarkDetail(benchmark, cached) {
   }
   return Number.isFinite(iops)
     ? `${formatInteger(iops)} IOPS${cached ? " · 缓存" : ""}`
-    : `已完成${cached ? " · 缓存" : ""}`;
+    : cached ? "缓存" : "";
 }
 
 function SpeedBenchmark({ job, config, onStart, startDisabled }) {
   const completedResultValid = job.status !== "completed" || isCompleteSpeedResult(job);
   const finished = !ACTIVE.has(job.status) && job.status !== "idle";
-  const hasModernProfile = job.options?.speedProfile === true || typeof job.options?.speedIOEngine === "string";
-  const matrixConfig = job.status === "idle"
-    ? config
-    : {
-        speedBlockSize: job.options?.speedBlockSize ?? config.speedBlockSize,
-        speedQueueDepth: job.options?.speedQueueDepth ?? config.speedQueueDepth,
-        speedThreads: job.options?.speedThreads ?? config.speedThreads,
-        speedIOEngine: job.options?.speedIOEngine ?? config.speedIOEngine
-      };
-  const speedRows = hasModernProfile || job.status === "idle" ? configuredSpeedRows(matrixConfig) : LEGACY_SPEED_ROWS;
+  const idle = job.status === "idle";
+  const options = idle ? config : job.options || {};
+  const crystal = idle || isCrystalSpeedPreset(options.speedPreset);
+  const configured = idle || options.speedPreset === CRYSTAL_SPEED_PRESET || (!crystal && options.speedProfile === true);
+  const rows = configured ? configuredSpeedRows(options, crystal) : LEGACY_SPEED_ROWS;
+  const speedRows = crystal && options.speedIOEngine === "psync" ? rows.filter(row => row.profileRow.endsWith("-low")) : rows;
+  const columns = SPEED_COLUMNS;
   const cached = job.options?.speedDirectIO === false;
-  const cells = speedBenchmarkCells(job, speedRows);
+  const cells = speedBenchmarkCells(job, speedRows, columns.map(column => column.operation));
   const testingCell = cells.find((cell) => cell.active);
-  const startBenchmark = (row) => onStart({
-    type: "speed",
-    speedRuns: config.speedRuns,
-    sampleMiB: config.sampleMiB,
-    speedPosition: "all",
-    speedIOEngine: config.speedIOEngine,
-    speedDirectIO: config.speedDirectIO,
-    speedTrim: config.speedTrim,
-    speedProfile: true,
-    speedProfileRow: row.profileRow,
-    ...(config.speedOperation !== "auto" ? { speedOperation: config.speedOperation } : {}),
-    ...(row ? {
-      speedPattern: row.pattern,
-      speedBlockSize: row.blockSize,
-      speedQueueDepth: row.queueDepth,
-      speedThreads: row.threads
-    } : {})
-  });
+  const startBenchmark = (row) => onStart({ ...speedRunOptions(config), speedProfileRow: row.profileRow });
 
   return (
     <div className="benchmark-panel">
@@ -1601,27 +1582,27 @@ function SpeedBenchmark({ job, config, onStart, startDisabled }) {
       {job.status === "failed" && (
         <div className="inline-alert danger benchmark-failure" role="alert"><AlertTriangle size={18} aria-hidden="true" /><span>测速失败：{job.message || "任务异常结束，请重新测速。"}</span></div>
       )}
-      {job.status === "completed" && !completedResultValid && (
+      {job.status === "completed" && Object.prototype.hasOwnProperty.call(job, "result") && !completedResultValid && (
         <div className="inline-alert warning" role="alert"><AlertTriangle size={18} /><span>历史测速明细格式不正确，无法显示部分或全部结果。</span></div>
       )}
-      <div className="benchmark-matrix" role="table" aria-label="磁盘读取、写入和混合测速结果">
+      <div className="benchmark-matrix" style={{ "--benchmark-columns": columns.length, "--benchmark-rows": speedRows.length }} role="table" aria-label="磁盘测速结果">
         <div className="benchmark-matrix-header" role="row">
           <div className="benchmark-corner" role="columnheader">测试项目</div>
-          {SPEED_COLUMNS.map((column) => (
-            <div className={`benchmark-column ${column.operation}`} role="columnheader" key={column.operation} data-tooltip={column.operation === "mixed" ? "混合读写：70% 读取、30% 写入" : undefined}>
-              <strong>{column.label}</strong><small>{column.operation === "mixed" ? "MB/s · 读 70%" : "MB/s"}</small>
+          {columns.map((column) => (
+            <div className={`benchmark-column ${column.operation}`} role="columnheader" key={column.operation}>
+              <strong>{column.label}</strong><small>MB/s</small>
             </div>
           ))}
         </div>
         {speedRows.map((row, rowIndex) => {
           return (
-            <div className={`benchmark-matrix-row${rowIndex === 2 ? " benchmark-group-start" : ""}`} role="row" key={row.key}>
+            <div className={`benchmark-matrix-row${rowIndex > 0 && speedRows[rowIndex - 1].pattern !== row.pattern ? " benchmark-group-start" : ""}`} role="row" key={row.key}>
               <div className="benchmark-test-cell" role="rowheader">
                 <button
                   className="benchmark-test-label"
                   type="button"
                   onClick={() => startBenchmark(row)}
-                  disabled={startDisabled}
+                  disabled={startDisabled || (config.speedIOEngine === "psync" && row.profileRow.endsWith("-high"))}
                   aria-label={`单独运行${row.title}测速`}
                   data-tooltip={`单独运行 ${row.pattern === "sequential" ? "顺序" : "随机"} ${formatBinaryBytes(row.blockSize)} 测速\n队列深度 ${row.queueDepth} · 并发任务 ${row.threads}\n${row.title}`}
                 >
@@ -1630,25 +1611,21 @@ function SpeedBenchmark({ job, config, onStart, startDisabled }) {
                   <small>Q{row.queueDepth} · T{row.threads}</small>
                 </button>
               </div>
-              {SPEED_COLUMNS.map(({ operation, label }, columnIndex) => {
-                  const { benchmark, active: testing, skipped: combinationSkipped } = cells[rowIndex * SPEED_COLUMNS.length + columnIndex];
+              {columns.map(({ operation, label }, columnIndex) => {
+                  const { benchmark, live, active: testing, skipped: combinationSkipped } = cells[rowIndex * columns.length + columnIndex];
                   const write = operation === "write";
+                  const liveValue = testing && Number.isFinite(live?.mbps) ? live.mbps : null;
                   const averageMBps = benchmark?.averageMBps;
                   const hasValue = Number.isFinite(averageMBps);
-                  const status = hasValue
-                    ? "已完成"
-                    : testing ? "测试中"
-                    : (job.status === "idle" ? "尚未开始" : (finished ? (combinationSkipped ? "未执行" : "未完成") : "等待测试"));
-                  const detail = hasValue ? benchmarkDetail(benchmark, cached) : status;
-                  const formattedValue = hasValue
-                    ? averageMBps.toFixed(1)
-                    : "--";
-                  const accessibleValue = hasValue
+                  const status = testing ? "测试中" : (idle ? "尚未开始" : (finished ? (combinationSkipped ? "未执行" : "无结果") : "等待测试"));
+                  const detail = hasValue ? benchmarkDetail(benchmark, cached) : "";
+                  const formattedValue = hasValue ? averageMBps.toFixed(1) : liveValue !== null ? liveValue.toFixed(1) : "--";
+                  const accessibleValue = hasValue || liveValue !== null
                     ? `${formattedValue} MB/s`
                     : status;
                   return (
                     <div
-                      className={`benchmark-result-cell ${operation}${hasValue ? "" : " pending"}${testing ? " testing" : ""}`}
+                      className={`benchmark-result-cell ${operation}${hasValue ? "" : " pending"}${testing ? " testing" : ""}${liveValue !== null ? " has-live-value" : ""}`}
                       role="cell"
                       key={operation}
                       aria-busy={testing || undefined}
@@ -1656,9 +1633,15 @@ function SpeedBenchmark({ job, config, onStart, startDisabled }) {
                     >
                       <span className="benchmark-cell-operation" aria-hidden="true">{label} · MB/s</span>
                       <strong className="benchmark-result-number" data-tooltip={hasValue ? `${formattedValue} MB/s` : undefined}>
-                        {testing ? <span className="loading-215" aria-hidden="true" /> : formattedValue}
+                        {formattedValue}
                       </strong>
-                      <small className="benchmark-result-detail" data-tooltip={detail}>{detail || status}</small>
+                      <div className="benchmark-result-meta">
+                        {detail && <small className="benchmark-result-detail" data-tooltip={detail}>{detail}</small>}
+                        {testing && live && <>
+                          <span className="benchmark-cell-animation" aria-hidden="true" />
+                          <progress className="sr-only" max={live.durationSeconds} value={live.elapsedSeconds || 0} aria-label="当前测试进度" />
+                        </>}
+                      </div>
                     </div>
                   );
                 })}
@@ -1738,7 +1721,7 @@ function HistoryTrigger({ onOpen, inline = false }) {
   return inline ? button : <div className="history-access">{button}</div>;
 }
 
-function HistoryDialog({ mode, selectedId, deletedId, onSelect, onDelete, onClose, selectionLocked }) {
+function HistoryDialog({ disks, storageSpaces, mode, selectedId, deletedId, onSelect, onDelete, onClose, selectionLocked }) {
   const dialogRef = useRef(null);
   const [jobs, setJobs] = useState([]);
   const [loadState, setLoadState] = useState({ status: "loading", error: "" });
@@ -1797,6 +1780,7 @@ function HistoryDialog({ mode, selectedId, deletedId, onSelect, onDelete, onClos
           <ul className="history-list" aria-label="检测任务历史">
             {jobs.map((job) => {
               const speed = speedHistorySummary(job);
+              const model = jobDiskModel(job, disks, storageSpaces);
               const note = job.message || job.phase || "";
               return (
               <li key={job.id}>
@@ -1814,7 +1798,7 @@ function HistoryDialog({ mode, selectedId, deletedId, onSelect, onDelete, onClos
                     </span>
                     <span className="history-record-disk">
                       <strong data-tooltip={job.device}>{job.storageSpace ? storageSpaceLabel(job.storageSpace) : job.device}</strong>
-                      <small>{job.disk?.model || "未知型号"}</small>
+                      <small data-tooltip={model.tooltip}>{model.text}</small>
                     </span>
                     <span className={`history-record-result${speed ? " history-record-speed" : ""}`} data-tooltip={speed ? [speed.tooltip, note].filter(Boolean).join("\n") : undefined}>
                       {speed?.text || job.message || (job.type === "speed" ? (job.phase || "尚无测速结果") : "暂无结果摘要")}
@@ -1905,6 +1889,7 @@ function ConfirmDialog({ request, onClose, onConfirm, submitting }) {
   const speed = request.type === "speed";
   const rawSpeed = speed && request.speedTarget === "raw";
   const rawWillWrite = rawSpeed && request.speedOperation !== "read";
+  const requestedSpeedRow = speed && configuredSpeedRows(request, true).find(row => row.profileRow === request.speedProfileRow);
   const repair = scan && request.scanRepair === true;
   const repairConfirmed = !repair || String(eraseConfirmation || "").trim().toUpperCase() === "REPAIR";
   const fullScan = scan && request.scanMode === "full";
@@ -1948,10 +1933,10 @@ function ConfirmDialog({ request, onClose, onConfirm, submitting }) {
           {scan && request.scanSelfTest && <div><dt>固件自检</dt><dd>先运行 NVMe 扩展自检，再扫描；不支持时会提示停止</dd></div>}
           {repair && <div><dt>慢扇区修复</dt><dd>单次读取超过 {request.scanRepairAfterMs} ms 后，备份并写回同一范围的原始数据，再读回校验</dd></div>}
           {scan && <div><dt>结果形式</dt><dd>{fullScan ? SCAN_CELL_COUNT : QUICK_SCAN_CELL_COUNT} 格响应时间块图</dd></div>}
-          {speed && <div><dt>测试组合</dt><dd>{request.speedOperation === "read" ? "仅读取" : (request.speedOperation === "write" ? "仅写入" : (request.speedOperation === "mixed" ? "混合 70/30" : "全部组合"))} · {request.speedPattern === "sequential" ? `SEQ${speedBlockCode(request.speedBlockSize || 1048576)} Q${request.speedQueueDepth || 1}T${request.speedThreads || 1}` : (request.speedPattern === "random" ? `RND4K Q${request.speedQueueDepth || 1}T${request.speedThreads || 1}` : "全部测试项目")}</dd></div>}
-          {speed && <div><dt>测试次数</dt><dd>{request.speedRuns || 1} 次</dd></div>}
-          {speed && <div><dt>每项样本</dt><dd>{formatBinaryBytes((request.sampleMiB || 1024) * 1024 * 1024)}</dd></div>}
-          {speed && <div><dt>I/O 引擎</dt><dd>{request.speedIOEngine || "io_uring"} · Q{request.speedQueueDepth || 1}T{request.speedThreads || 1}</dd></div>}
+          {speed && <div><dt>测试组合</dt><dd>{({ read: "仅读取", write: "仅写入", mixed: "混合 50/50" })[request.speedOperation] || "读取、写入和混合"} · {requestedSpeedRow?.title || "全部测试项目"}</dd></div>}
+          {speed && <div><dt>测试次数</dt><dd>{request.speedRuns || CRYSTAL_SPEED_RUNS} 次</dd></div>}
+          {speed && <div><dt>测试范围</dt><dd>{rawSpeed && isCrystalSpeedPreset(request.speedPreset) ? "从磁盘起始位置起 " : ""}{formatBinaryBytes((request.sampleMiB || 1024) * 1024 * 1024)}</dd></div>}
+          {speed && <div><dt>I/O 引擎</dt><dd>{request.speedIOEngine || "io_uring"}{request.speedIOEngine === "psync" ? " · 仅 Q1 项目" : ""}</dd></div>}
           {speed && <div><dt>缓存策略</dt><dd>{request.speedDirectIO === false ? "使用系统缓存" : "Direct I/O"}{request.speedTrim && !rawSpeed ? " · 测速前 TRIM" : ""}</dd></div>}
         </dl>
         {rawWillWrite && (
@@ -1992,8 +1977,9 @@ function ConfirmDialog({ request, onClose, onConfirm, submitting }) {
               ? { scanMode: request.scanMode, scanExactSectors: request.scanExactSectors === true, scanDeepLocate: request.scanDeepLocate === true, scanSelfTest: request.scanSelfTest === true, scanRepair: repair, ...(repair ? { scanRepairAfterMs: request.scanRepairAfterMs, scanRepairAcknowledged: true } : {}) }
               : {
                     sampleMiB: request.sampleMiB || 1024,
-                    speedRuns: request.speedRuns || 1,
-                    speedPosition: request.speedPosition || "all",
+                    speedRuns: request.speedRuns || CRYSTAL_SPEED_RUNS,
+                    ...(request.speedPreset ? { speedPreset: request.speedPreset } : {}),
+                    ...(request.speedPosition ? { speedPosition: request.speedPosition } : {}),
                     ...(request.speedOperation ? { speedOperation: request.speedOperation } : {}),
                     ...(request.speedPattern ? { speedPattern: request.speedPattern } : {}),
                     ...(request.speedBlockSize ? { speedBlockSize: request.speedBlockSize } : {}),
@@ -2059,7 +2045,7 @@ function ResumeScanDialog({ request, onClose, onContinue, onRestart, submitting,
   </dialog>;
 }
 
-function RunningTasks({ jobs, selectedId, onSelect, onCancel, cancellingIds, locked }) {
+function RunningTasks({ disks, storageSpaces, jobs, selectedId, onSelect, onCancel, cancellingIds, locked }) {
   if (!jobs.length) return null;
   return <section className="running-tasks" aria-label="运行中的任务">
     <div className="running-tasks-heading">运行中 <span>{jobs.length}</span></div>
@@ -2067,7 +2053,7 @@ function RunningTasks({ jobs, selectedId, onSelect, onCancel, cancellingIds, loc
       {jobs.map(job => {
         const stopping = job.status === "cancelling" || cancellingIds.has(job.id);
         const label = job.type === "speed" ? "测速" : job.options?.scanRepairFrom ? "修复" : "扫描";
-        const model = job.disk?.model || "未知硬盘型号";
+        const model = jobDiskModel(job, disks, storageSpaces).text;
         const progress = Math.max(0, Math.min(100, Number(job.progress) || 0));
         return <div className={`running-task${selectedId === job.id ? " selected" : ""}`} key={job.id}>
           <button type="button" className="running-task-view" disabled={locked} aria-pressed={selectedId === job.id} aria-label={`查看 ${model}（${job.device}）${label}`} data-tooltip={`${model} · ${job.device}\n${job.phase || label}`} onClick={() => onSelect(job)}>
@@ -2122,11 +2108,11 @@ function App() {
   const [scanRepair, setScanRepair] = useState(false);
   const [scanRepairAfterMs, setScanRepairAfterMs] = useState(500);
   const [speedConfig, setSpeedConfig] = useState({
-    speedRuns: 1,
+    speedRuns: CRYSTAL_SPEED_RUNS,
     sampleMiB: 1024,
     speedOperation: "auto",
     speedBlockSize: 1048576,
-    speedQueueDepth: 8,
+    speedQueueDepth: 0,
     speedThreads: 1,
     speedIOEngine: "io_uring",
     speedDirectIO: true,
@@ -2182,8 +2168,6 @@ function App() {
   const selectedDiskRef = useRef(null);
   const initialSelectionPendingRef = useRef(true);
   const selectedStorageRef = useRef(null);
-  const trimDefaultTargetRef = useRef("");
-  const speedDefaultsTargetRef = useRef("");
   const resumeLookupRef = useRef(null);
   const returnToScanRef = useRef(null);
 
@@ -2192,21 +2176,25 @@ function App() {
     storageSpaces.find((space) => space.path === selectedStoragePath) || storageSpaces[0] || null
   ), [selectedStoragePath, storageSpaces]);
   const speedTargets = useMemo(() => buildSpeedTargets(disks, storageSpaces), [disks, storageSpaces]);
-  const selectedSpeedTarget = useMemo(() => (
-    speedTargets.find((target) => target.key === selectedSpeedKey && !target.disabledReason)
+  const activeJobs = useMemo(() => jobs.filter(job => ACTIVE.has(job.status)), [jobs]);
+  const activeSpeedJob = mode === "speed" ? activeJobs.find(job => job.type === "speed") : null;
+  const selectedSpeedTarget = useMemo(() => {
+    if (activeSpeedJob) return speedTargets.find((target) => jobBelongsToSpeedTarget(activeSpeedJob, target)) || null;
+    return speedTargets.find((target) => target.key === selectedSpeedKey && !target.disabledReason)
       || speedTargets.find((target) => !target.disabledReason)
-      || null
-  ), [selectedSpeedKey, speedTargets]);
+      || null;
+  }, [activeSpeedJob, selectedSpeedKey, speedTargets]);
   const speedTargetModels = [...new Set((selectedSpeedTarget?.type === "raw"
     ? [selectedSpeedTarget.disk]
     : selectedSpeedTarget?.memberDisks || [])
     .map(disk => disk?.model?.trim()).filter(Boolean))].join(" + ") || "未知硬盘型号";
   const resultDeviceLabel = mode === "speed"
-    ? [isFnOsStorageSpacePath(selectedSpeedTarget?.path) ? storageSpaceLabel(selectedSpeedTarget.storageSpace) : "", speedTargetModels].filter(Boolean).join(" · ")
+    ? (!selectedSpeedTarget && activeSpeedJob
+      ? jobDiskModel(activeSpeedJob, disks, storageSpaces).text
+      : [isFnOsStorageSpacePath(selectedSpeedTarget?.path) ? storageSpaceLabel(selectedSpeedTarget.storageSpace) : "", speedTargetModels].filter(Boolean).join(" · "))
     : selectedDisk?.model || "未知硬盘型号";
-  const activeJobs = useMemo(() => jobs.filter(job => ACTIVE.has(job.status)), [jobs]);
-  const activeJob = useMemo(() => activeJobForTarget(jobs, mode, selectedDisk, selectedSpeedTarget), [jobs, mode, selectedDisk, selectedSpeedTarget]);
-  const startBlockedReason = activeJob ? "" : taskStartBlockedReason(jobs, mode, selectedDisk);
+  const activeJob = activeSpeedJob || activeJobForTarget(jobs, mode, selectedDisk, selectedSpeedTarget);
+  const startBlockedReason = activeJob ? "" : taskStartBlockedReason(jobs, mode, selectedDisk, selectedSpeedTarget);
   const diskJobs = useMemo(() => (
     selectedDisk ? jobs.filter((job) => jobBelongsToDisk(job, selectedDisk)) : []
   ), [jobs, selectedDisk]);
@@ -2287,46 +2275,8 @@ function App() {
   }, [selectedStorageSpace]);
 
   useEffect(() => {
-    if (!selectedSpeedTarget) {
-      speedDefaultsTargetRef.current = "";
-      return;
-    }
-    const defaults = speedTargetDefaults(selectedSpeedTarget, disks);
-    const defaultsKey = JSON.stringify([selectedSpeedTarget.key, defaults.speedQueueDepth, defaults.speedThreads]);
-    if (speedDefaultsTargetRef.current === defaultsKey) return;
-    speedDefaultsTargetRef.current = defaultsKey;
-    // Reapply media defaults on target changes, without replacing a manual
-    // choice during inventory refreshes or switches between scan and speed.
-    setSpeedConfig(current => {
-      const queueDepth = current.speedIOEngine === "psync" ? 1 : defaults.speedQueueDepth;
-      return current.speedQueueDepth === queueDepth && current.speedThreads === defaults.speedThreads
-        ? current : { ...current, speedQueueDepth: queueDepth, speedThreads: defaults.speedThreads };
-    });
-  }, [disks, selectedSpeedTarget]);
-
-  useEffect(() => {
-    const targetPath = selectedSpeedTarget?.key || "";
-    if (!targetPath) {
-      trimDefaultTargetRef.current = "";
-      return;
-    }
-    if (!health || trimDefaultTargetRef.current === targetPath) return;
-    if (selectedSpeedTarget.type === "raw") {
-      trimDefaultTargetRef.current = targetPath;
-      setSpeedConfig((current) => ({ ...current, speedTrim: false }));
-      return;
-    }
-    const currentSpace = selectedSpeedTarget.storageSpace;
-    const members = Array.isArray(currentSpace.members) ? currentSpace.members : [];
-    const inventoryComplete = members.length > 0 && members.every((member) => disks.some((disk) => disk.path === member));
-    if (!inventoryComplete) return;
-
-    trimDefaultTargetRef.current = targetPath;
-    const trimByDefault = health.capabilities?.fstrim === true
-      && isFnOsStorageSpacePath(currentSpace.path)
-      && storageSpaceUsesOnlySolidStateDisks(currentSpace, disks);
-    setSpeedConfig((current) => ({ ...current, speedTrim: trimByDefault }));
-  }, [disks, health, selectedSpeedTarget]);
+    setSpeedConfig(current => current.speedTrim ? { ...current, speedTrim: false } : current);
+  }, [selectedSpeedTarget?.key]);
 
   useEffect(() => {
     if (mode !== "speed" || loading) return;
@@ -2567,6 +2517,7 @@ function App() {
   const shownJobNeedsDetail = Boolean(
     shownJob
     && !shownJob.id.startsWith("pending-")
+    && !(shownJob.type === "speed" && ACTIVE.has(shownJob.status))
     && !Object.prototype.hasOwnProperty.call(shownJob, "result")
   );
   useEffect(() => {
@@ -2951,7 +2902,7 @@ function App() {
                 selected={selectedDisk}
                 onSelect={selectDisk}
                 loading={loading}
-                locked={creatingJob}
+                locked={creatingJob || Boolean(activeSpeedJob)}
                 onRefresh={() => refresh()}
                 refreshing={refreshing}
                 availabilityError={diskAvailabilityError}
@@ -3007,7 +2958,7 @@ function App() {
                       </div>
                       <ModeSwitcher mode={mode} setMode={selectMode} />
                     </div>
-                    <RunningTasks jobs={activeJobs} selectedId={shownJob?.id} onSelect={selectHistoryJob} onCancel={cancelJob} cancellingIds={cancellingJobIds} locked={creatingJob} />
+                    {mode === "scan" && <RunningTasks disks={disks} storageSpaces={storageSpaces} jobs={activeJobs} selectedId={shownJob?.id} onSelect={selectHistoryJob} onCancel={cancelJob} cancellingIds={cancellingJobIds} locked={creatingJob} />}
                   </div>
                   <ActiveTask
                     job={shownJob}
@@ -3042,6 +2993,7 @@ function App() {
       {resumeRequest && <ResumeScanDialog request={resumeRequest} onClose={() => { if (!creatingJob) setResumeRequest(null); }}
         onContinue={() => resumeScan()} onRestart={() => resumeScan(true)} submitting={creatingJob} error={actionError} />}
       {historyOpen && <HistoryDialog
+        disks={disks} storageSpaces={storageSpaces}
         mode={mode}
         selectedId={shownJob?.id}
         deletedId={deletedHistoryId}
