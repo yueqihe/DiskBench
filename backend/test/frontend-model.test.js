@@ -9,18 +9,19 @@ let findLatestScanJob;
 let findResumableScan;
 let mergeJobLists;
 let mergeScanProgress;
-let planScanReveal;
-let advanceScanReveal;
 let safeScanMap;
 let scanStatusGroup;
 let safeSpeedSamples;
 let isCompleteScanResult;
 let isCompleteSpeedResult;
 let chooseShownJob;
+let activeJobForTarget;
+let taskStartBlockedReason;
 let detailRetryDelay;
 let storageSpaceForDisk;
 let storageSpacesForDisk;
 let storageSpaceUsesOnlySolidStateDisks;
+let speedTargetDefaults;
 let estimateRemainingMilliseconds;
 let formatEstimatedDuration;
 let terminalScanPrefix;
@@ -52,14 +53,14 @@ test.before(async () => {
     findResumableScan,
     mergeJobLists,
     mergeScanProgress,
-    planScanReveal,
-    advanceScanReveal,
     safeScanMap,
     scanStatusGroup,
     safeSpeedSamples,
     isCompleteScanResult,
     isCompleteSpeedResult,
     chooseShownJob,
+    activeJobForTarget,
+    taskStartBlockedReason,
     detailRetryDelay,
     estimateRemainingMilliseconds,
     formatEstimatedDuration,
@@ -67,6 +68,7 @@ test.before(async () => {
     storageSpaceForDisk,
     storageSpacesForDisk,
     storageSpaceUsesOnlySolidStateDisks,
+    speedTargetDefaults,
     buildSpeedTargets,
     jobBelongsToSpeedTarget,
     rawSpeedDiskBlockedReason,
@@ -94,6 +96,29 @@ test("scan ETA uses elapsed time and actual task progress", () => {
   const now = Date.parse("2026-09-11T10:10:00.000Z");
   assert.equal(estimateRemainingMilliseconds({ type: "scan", status: "running", startedAt, progress: 25 }, now), 30 * 60_000);
   assert.equal(estimateRemainingMilliseconds({ type: "write", status: "running", startedAt, progress: 50 }, now), 10 * 60_000);
+});
+
+test("parallel scan selection and admission follow each physical disk", () => {
+  const a = { path: "/dev/sda", serial: "A", size: 1000 };
+  const b = { path: "/dev/sdb", serial: "B", size: 1000 };
+  const c = { path: "/dev/sdc", serial: "C", size: 1000 };
+  const scan = (id, disk, status = "running") => ({ id, type: "scan", device: disk.path, disk, status });
+  const first = scan("a", a), second = scan("b", b, "cancelling");
+  const jobs = [second, first, scan("old", c, "completed")];
+  assert.equal(activeJobForTarget(jobs, "scan", a), first);
+  assert.equal(activeJobForTarget(jobs, "scan", b), second);
+  assert.equal(activeJobForTarget(jobs, "scan", c), null);
+  assert.equal(activeJobForTarget(jobs, "speed", a), null);
+  assert.equal(taskStartBlockedReason(jobs, "scan", c), "");
+  assert.match(taskStartBlockedReason(jobs, "scan", a), /这块硬盘/);
+  assert.match(taskStartBlockedReason(jobs, "scan", { ...a, path: "/dev/sdz" }), /这块硬盘/);
+  assert.match(taskStartBlockedReason(jobs, "scan", { ...a, serial: "replacement" }), /这块硬盘/);
+  assert.match(taskStartBlockedReason(jobs, "speed", c), /测速/);
+  assert.match(taskStartBlockedReason([{ ...first, type: "speed" }], "scan", c), /测速/);
+  const space = { path: "/vol1", members: [a.path] };
+  const speed = { ...first, type: "speed", device: space.path, storageSpace: space };
+  const target = { type: "filesystem", path: space.path, storageSpace: space };
+  assert.equal(activeJobForTarget([speed], "speed", a, target), speed);
 });
 
 test("resume selects the newest unfinished scan by disk identity, even after a path change", () => {
@@ -161,29 +186,6 @@ test("estimated durations stay compact and readable", () => {
   assert.equal(formatEstimatedDuration(38 * 60_000), "约 38 分钟");
   assert.equal(formatEstimatedDuration((2 * 60 + 14) * 60_000), "约 2 小时 14 分钟");
   assert.equal(formatEstimatedDuration((3 * 24 + 4) * 60 * 60_000), "约 3 天 4 小时");
-});
-
-test("scan cells reveal in a stable order across fast progress batches", () => {
-  const first = planScanReveal(0, 6, 1_000);
-  assert.deepEqual(first.delays, [0, 4, 8, 12, 16, 20]);
-  const second = planScanReveal(first.finishAt, 100, 1_050);
-  assert.equal(second.delays[0], 0);
-  assert.ok(second.delays.every((delay, index) => index === 0 || delay - second.delays[index - 1] === 4));
-  const queued = planScanReveal(second.finishAt, 20, 1_100);
-  assert.equal(queued.delays[0], second.finishAt - 1_100);
-  assert.ok(queued.delays[0] >= 0);
-  assert.equal(queued.finishAt, second.finishAt + 19 * 4);
-  assert.equal(planScanReveal(second.finishAt, 0, 1_100).delays.length, 0);
-});
-
-test("frame-driven scan reveal advances slow batches individually and caps fast catch-up", () => {
-  assert.deepEqual(advanceScanReveal(10, 11, 17), { prefix: 11, carry: 0 });
-  assert.deepEqual(advanceScanReveal(10, 13, 17), { prefix: 11, carry: 0 });
-  const fast = advanceScanReveal(0, 2048, 17);
-  assert.ok(fast.prefix >= 4 && fast.prefix <= 5);
-  const delayedFrame = advanceScanReveal(0, 2048, 500);
-  assert.ok(delayedFrame.prefix <= 9);
-  assert.deepEqual(advanceScanReveal(20, 20, 17, 0.8), { prefix: 20, carry: 0 });
 });
 
 function job(overrides = {}) {
@@ -306,6 +308,32 @@ test("TRIM defaults on only when every storage-space member is solid state", () 
   assert.equal(storageSpaceUsesOnlySolidStateDisks({ path: "/vol5", members: [] }, disks), false);
 });
 
+test("high queue and concurrency defaults require confirmed solid-state media for every target member", () => {
+  const disks = [
+    disk({ path: "/dev/nvme0n1", rotational: false }),
+    disk({ path: "/dev/sdb", rotational: false }),
+    disk({ path: "/dev/sdc", rotational: true }),
+    disk({ path: "/dev/sdd", rotational: undefined })
+  ];
+  const spaces = [
+    { path: "/vol1", members: ["/dev/nvme0n1"] },
+    { path: "/vol2", members: ["/dev/nvme0n1", "/dev/sdb"] },
+    { path: "/vol3", members: ["/dev/sdc"] },
+    { path: "/vol4", members: ["/dev/sdb", "/dev/sdc"] },
+    { path: "/vol5", members: ["/dev/sdb", "/dev/missing"] },
+    { path: "/vol6", members: ["/dev/sdd"] },
+    { path: "/vol7", members: [] }
+  ];
+  const targets = buildSpeedTargets(disks, spaces);
+  const profile = target => {
+    const defaults = speedTargetDefaults(target, disks);
+    return [defaults.speedQueueDepth, defaults.speedThreads];
+  };
+  assert.deepEqual(targets.filter(target => target.type === "filesystem").map(profile), [[64, 8], [64, 8], [8, 1], [8, 1], [8, 1], [8, 1], [8, 1]]);
+  assert.deepEqual(targets.filter(target => target.type === "raw").map(profile), [[64, 8], [64, 8], [8, 1], [8, 1]]);
+  assert.deepEqual(speedTargetDefaults(null, disks), { speedQueueDepth: 8, speedThreads: 1 });
+});
+
 test("speed targets use raw I/O whenever no filesystem or storage space is recognized", () => {
   const space = { path: "/vol1", members: ["/dev/sda"], fileSystem: "btrfs", size: 1000 };
   const targets = buildSpeedTargets([
@@ -333,6 +361,22 @@ test("mounted external disks use their filesystem target instead of raw I/O", ()
   const targets = buildSpeedTargets([externalDisk], [externalSpace]);
   assert.equal(targets.find((target) => target.key === "filesystem:/media/Backup SSD").disabledReason, "");
   assert.equal(targets.find((target) => target.key === "raw:/dev/sdg").disabledReason.includes("文件测速"), true);
+});
+
+test("system disks expose a file benchmark target while raw I/O stays blocked", () => {
+  const systemDisk = disk({ isSystem: true, path: "/dev/nvme0n1", mountpoints: ["/"], fileSystems: ["ext4"] });
+  const systemSpace = {
+    path: "/tmp", source: "/dev/nvme0n1p2", fileSystem: "ext4", isSystem: true,
+    members: [systemDisk.path], size: 20_000_000_000, freeBytes: 10_000_000_000
+  };
+  const targets = buildSpeedTargets([systemDisk], [systemSpace]);
+  const file = targets.find((target) => target.key === "filesystem:/tmp");
+  assert.equal(file.disabledReason, "");
+  assert.equal(file.storageSpace.isSystem, true);
+  assert.deepEqual(file.memberDisks, [systemDisk]);
+  assert.match(targets.find((target) => target.type === "raw").disabledReason, /系统盘.*文件测速/);
+  assert.equal(jobBelongsToSpeedTarget({ type: "speed", device: "/tmp", storageSpace: systemSpace }, file), true);
+  assert.match(rawSpeedDiskBlockedReason(systemDisk, []), /系统盘.*底层测速/);
 });
 
 test("raw speed history follows the physical target instead of its member volume", () => {

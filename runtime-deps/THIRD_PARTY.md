@@ -17,6 +17,8 @@ Additional components included in the compiled application:
 - React 19.2.8 and React DOM 19.2.8 (MIT, Meta Platforms, Inc. and affiliates)
 - Scheduler 0.27.0 (MIT, Meta Platforms, Inc. and affiliates)
 - Lucide React 0.542.0 (ISC, with portions derived from Feather under MIT)
+- @trimjs/web-app 0.6.0 (official fnOS web app SDK for host theme integration;
+  the published npm package does not include a license declaration or license text)
 - Go standard library and runtime (BSD-3-Clause, The Go Authors;
   compiler version recorded in the binary build information)
 

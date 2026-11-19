@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -91,8 +92,8 @@ type Disk struct {
 	CriticalWarning       *int64 `json:"criticalWarning,omitempty"`       // NVMe critical_warning bitmask
 }
 
-// StorageSpace is a mounted fnOS data volume. Speed tests target this logical
-// layer so an array is measured as a whole instead of benchmarking one member.
+// StorageSpace is a local file benchmark target. For a system disk its Path
+// is a verified temporary directory on that disk, rather than the root mount.
 type StorageSpace struct {
 	Path       string   `json:"path"`
 	Source     string   `json:"source"`
@@ -102,6 +103,7 @@ type StorageSpace struct {
 	Size       int64    `json:"size"`
 	FreeBytes  int64    `json:"freeBytes"`
 	ReadOnly   bool     `json:"readOnly"`
+	IsSystem   bool     `json:"isSystem,omitempty"`
 }
 
 type storageMount struct {
@@ -749,7 +751,7 @@ func parseStorageMounts(output string) []storageMount {
 		for i := range fields {
 			fields[i] = decodeMountField(fields[i])
 		}
-		if !safeStorageMountPath(fields[0]) {
+		if !safeStorageMountPath(fields[0]) || !isLocalStorageMount(fields[1], fields[2]) {
 			continue
 		}
 		size, sizeErr := strconv.ParseInt(fields[3], 10, 64)
@@ -773,11 +775,17 @@ func parseStorageMounts(output string) []storageMount {
 	return mounts
 }
 
-func storageDiskAncestors(source string) ([]string, string) {
-	// Btrfs may suffix its source with a subvolume path, which lsblk does not accept.
+func storageMountSource(source string) string {
+	// findmnt suffixes Btrfs subvolumes and bind mounts with their filesystem
+	// root, e.g. /dev/mapper/data[/@appdata/tool/logs].
 	if index := strings.Index(source, "["); index >= 0 {
-		source = source[:index]
+		return source[:index]
 	}
+	return source
+}
+
+func storageDiskAncestors(source string) ([]string, string) {
+	source = storageMountSource(source)
 	if !strings.HasPrefix(source, "/dev/") {
 		return nil, ""
 	}
@@ -846,7 +854,7 @@ func zfsPoolMembers(source, zpoolExe string) ([]string, string) {
 func deriveStorageSpaces(disks []Disk, mounts []storageMount) []StorageSpace {
 	byPath := make(map[string]*StorageSpace)
 	for _, mount := range mounts {
-		if !safeStorageMountPath(mount.Path) {
+		if !safeStorageMountPath(mount.Path) || !isLocalStorageMount(mount.Source, mount.FileSystem) {
 			continue
 		}
 		if _, exists := byPath[mount.Path]; exists {
@@ -867,6 +875,20 @@ func deriveStorageSpaces(disks []Disk, mounts []storageMount) []StorageSpace {
 	}
 	spaces := make([]StorageSpace, 0, len(byPath))
 	for _, space := range byPath {
+		// fnOS app-data/log bind mounts are views into an existing volume,
+		// not extra disks. Keep the parent volume as the benchmark target.
+		// A nested mount backed by another filesystem/device remains distinct.
+		redundant := false
+		for parentPath, parent := range byPath {
+			if strings.HasPrefix(space.Path, parentPath+"/") && space.FileSystem == parent.FileSystem &&
+				storageMountSource(space.Source) == storageMountSource(parent.Source) {
+				redundant = true
+				break
+			}
+		}
+		if redundant {
+			continue
+		}
 		space.Members = uniqueStrings(space.Members)
 		if len(space.Members) > 1 {
 			space.Layout = "raid"
@@ -877,6 +899,105 @@ func deriveStorageSpaces(disks []Disk, mounts []storageMount) []StorageSpace {
 	return spaces
 }
 
+// Capacity columns cause findmnt to call statvfs. Restrict them to local
+// filesystems so an offline SMB/NFS/FTP/FUSE mount cannot stall disk discovery.
+const localStorageFileSystems = "btrfs,ext2,ext3,ext4,xfs,f2fs,zfs,bcachefs,ntfs,ntfs3,exfat,vfat,msdos,fuseblk,udf,iso9660,hfs,hfsplus"
+
+func isLocalStorageMount(source, fileSystem string) bool {
+	fileSystem = strings.ToLower(fileSystem)
+	if fileSystem == "" || !strings.Contains(","+localStorageFileSystems+",", ","+fileSystem+",") {
+		return false
+	}
+	// Local NTFS may use fuseblk. Generic FUSE and remote filesystem types
+	// are excluded; a mount path under /volN alone does not prove locality.
+	if fileSystem == "zfs" {
+		// ZFS uses pool/dataset names rather than /dev sources. Its physical
+		// members are resolved from zpool before the space is made available.
+		return source != "" && !strings.HasPrefix(source, "/") && !strings.Contains(source, ":")
+	}
+	return strings.HasPrefix(source, "/dev/")
+}
+
+type storageMountExecutor func(context.Context, string, []string) ([]byte, error)
+
+func execStorageMounts(ctx context.Context, exe string, args []string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, exe, args...)
+	cmd.WaitDelay = time.Second
+	return cmd.Output()
+}
+
+func readStorageMounts(findmnt string, execute storageMountExecutor) ([]storageMount, error) {
+	for attempt, columns := range []string{"TARGET,SOURCE,FSTYPE,SIZE,AVAIL,OPTIONS", "TARGET,SOURCE,FSTYPE,SIZE,AVAIL"} {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		out, err := execute(ctx, findmnt, []string{"-rn", "-b", "-t", localStorageFileSystems, "-o", columns})
+		deadline := ctx.Err()
+		cancel()
+		if err == nil {
+			return parseStorageMounts(string(out)), nil
+		}
+		// findmnt exits 1 with no output when there are no matching mounts.
+		// A timeout must not trigger a second probe with an expired context.
+		if exit, ok := err.(*exec.ExitError); ok && exit.ExitCode() == 1 && len(out) == 0 && len(exit.Stderr) == 0 && deadline == nil {
+			return []storageMount{}, nil
+		}
+		if deadline != nil || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) || attempt == 1 {
+			return nil, fmt.Errorf("list mounted storage spaces: %w", err)
+		}
+	}
+	return []storageMount{}, nil
+}
+
+func systemBenchmarkPath(value string) bool {
+	return value == "/tmp" || value == "/var/tmp"
+}
+
+func readSystemStorageSpace(findmnt string, systemPaths map[string]bool, execute storageMountExecutor, ancestors func(string) ([]string, string)) *StorageSpace {
+	if len(systemPaths) == 0 {
+		return nil
+	}
+	for _, directory := range []string{"/tmp", "/var/tmp"} {
+		// Read metadata first: never request capacity on tmpfs or a remote
+		// filesystem, or accidentally benchmark a data disk mounted at /tmp.
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		out, err := execute(ctx, findmnt, []string{"-rn", "-T", directory, "-o", "TARGET,SOURCE,FSTYPE"})
+		cancel()
+		fields := strings.Fields(string(out))
+		if err != nil || len(fields) != 3 || !isLocalStorageMount(decodeMountField(fields[1]), fields[2]) {
+			continue
+		}
+		source, fileSystem := fields[1], fields[2]
+		members, layout := ancestors(decodeMountField(source))
+		eligible := len(members) > 0
+		for _, member := range members {
+			if !systemPaths[member] {
+				eligible = false
+			}
+		}
+		if !eligible {
+			continue
+		}
+		ctx, cancel = context.WithTimeout(context.Background(), 3*time.Second)
+		out, err = execute(ctx, findmnt, []string{"-rn", "-b", "-T", directory, "-o", "TARGET,SOURCE,FSTYPE,SIZE,AVAIL,OPTIONS"})
+		cancel()
+		fields = strings.Fields(string(out))
+		if err != nil || len(fields) != 6 || fields[1] != source || fields[2] != fileSystem {
+			continue
+		}
+		fields[0] = directory
+		mounts := parseStorageMounts(strings.Join(fields, " "))
+		if len(mounts) != 1 || mounts[0].ReadOnly {
+			continue
+		}
+		mount := mounts[0]
+		if layout == "" {
+			layout = "single"
+		}
+		return &StorageSpace{Path: directory, Source: mount.Source, FileSystem: mount.FileSystem,
+			Layout: strings.ToLower(layout), Members: members, Size: mount.Size, FreeBytes: mount.FreeBytes, IsSystem: true}
+	}
+	return nil
+}
+
 func listStorageSpaces(disks []Disk, findExe func(string) string) ([]StorageSpace, error) {
 	if findExe == nil {
 		findExe = findExecutable
@@ -885,17 +1006,11 @@ func listStorageSpaces(disks []Disk, findExe func(string) string) ([]StorageSpac
 	if findmnt == "" {
 		return []StorageSpace{}, nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, findmnt, "-rn", "-b", "-o", "TARGET,SOURCE,FSTYPE,SIZE,AVAIL,OPTIONS").Output()
+	mounts, err := readStorageMounts(findmnt, execStorageMounts)
 	if err != nil {
-		// Older findmnt versions may not expose OPTIONS in this output mode.
-		out, err = exec.CommandContext(ctx, findmnt, "-rn", "-b", "-o", "TARGET,SOURCE,FSTYPE,SIZE,AVAIL").Output()
-		if err != nil {
-			return nil, fmt.Errorf("list mounted storage spaces: %w", err)
-		}
+		return nil, err
 	}
-	spaces := deriveStorageSpaces(disks, parseStorageMounts(string(out)))
+	spaces := deriveStorageSpaces(disks, mounts)
 	systemPaths := getSystemPaths()
 	disksByPath := make(map[string]Disk, len(disks))
 	for _, disk := range disks {
@@ -930,6 +1045,9 @@ func listStorageSpaces(disks []Disk, findExe func(string) string) ([]StorageSpac
 		if eligible {
 			validSpaces = append(validSpaces, spaces[i])
 		}
+	}
+	if systemSpace := readSystemStorageSpace(findmnt, systemPaths, execStorageMounts, storageDiskAncestors); systemSpace != nil {
+		validSpaces = append(validSpaces, *systemSpace)
 	}
 	return validSpaces, nil
 }

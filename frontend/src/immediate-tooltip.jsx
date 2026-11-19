@@ -21,7 +21,8 @@ export function ImmediateTooltipProvider({ children }) {
     const targetFor = (node) => node instanceof Element ? node.closest("[data-tooltip]") : null;
     const insideTooltip = (node) => node instanceof Node && tooltipRef.current?.contains(node);
     const show = (target) => {
-      const text = target?.isConnected ? target.getAttribute("data-tooltip") : "";
+      const modal = [...document.querySelectorAll("dialog:modal")].at(-1);
+      const text = target?.isConnected && (!modal || modal.contains(target)) ? target.getAttribute("data-tooltip") : "";
       const next = text && target !== dismissed ? { target, text } : null;
       if (activeRef.current?.target === next?.target && activeRef.current?.text === next?.text) return;
       activeRef.current = next;
@@ -79,7 +80,8 @@ export function ImmediateTooltipProvider({ children }) {
     // containers. Portal into the current dialog to retain modal interaction.
     tooltip.showPopover?.();
     const place = () => {
-      if (!hint.target.isConnected) {
+      const modal = [...document.querySelectorAll("dialog:modal")].at(-1);
+      if (!hint.target.isConnected || (modal && !modal.contains(hint.target))) {
         activeRef.current = null;
         setHint(null);
         return;
@@ -87,7 +89,7 @@ export function ImmediateTooltipProvider({ children }) {
       const rect = hint.target.getBoundingClientRect();
       const { width, height } = tooltip.getBoundingClientRect();
       tooltip.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - width - 8))}px`;
-      const top = rect.bottom + height <= window.innerHeight - 8 ? rect.bottom : rect.top - height;
+      const top = rect.top - height >= 8 ? rect.top - height : rect.bottom;
       tooltip.style.top = `${Math.max(8, Math.min(top, window.innerHeight - height - 8))}px`;
     };
     place();

@@ -452,10 +452,24 @@ export function storageSpaceUsesOnlySolidStateDisks(storageSpace, disks) {
   });
 }
 
+export function speedTargetDefaults(target, disks) {
+  const solidState = record(target) && (target.type === "raw"
+    ? target.disk?.rotational === false
+    : target.type === "filesystem" && storageSpaceUsesOnlySolidStateDisks(target.storageSpace, disks));
+  return solidState ? { speedQueueDepth: 64, speedThreads: 8 } : { speedQueueDepth: 8, speedThreads: 1 };
+}
+
+export function storageSpaceLabel(space) {
+  if (record(space) && space.isSystem === true) return "系统盘";
+  const path = text(record(space) ? space.path : space);
+  const volume = /^\/vol(\d+)$/.exec(path);
+  return volume ? `存储空间 ${volume[1]}` : path;
+}
+
 export function rawSpeedDiskBlockedReason(disk, storageSpaces = []) {
   if (!record(disk) || !text(disk.path)) return "磁盘信息无效";
   const spaces = storageSpacesForDisk(storageSpaces, disk);
-  if (spaces.length > 0) return `由 ${spaces.map((space) => text(space.path)).filter(Boolean).join("、")} 提供文件测速`;
+  if (spaces.length > 0) return `由 ${spaces.map(storageSpaceLabel).filter(Boolean).join("、")} 提供文件测速`;
   if (disk.isSystem === true) return "系统盘不能执行底层测速";
   if (disk.readOnly === true) return "磁盘为只读状态";
   if (Array.isArray(disk.mountpoints) && disk.mountpoints.some((mountpoint) => text(mountpoint))) return "磁盘仍处于挂载状态";
@@ -663,32 +677,6 @@ export function mergeScanProgress(job, update) {
   };
 }
 
-export function planScanReveal(previousFinish, count, now) {
-  if (!Number.isSafeInteger(count) || count <= 0) return { delays: [], finishAt: now };
-  const start = Math.max(now, Number.isFinite(previousFinish) ? previousFinish : now);
-  const spacing = 4;
-  return {
-    delays: Array.from({ length: count }, (_, index) => Math.round(start - now + index * spacing)),
-    finishAt: start + (count - 1) * spacing
-  };
-}
-
-export function advanceScanReveal(current, target, elapsedMilliseconds, carry = 0) {
-  if (!Number.isSafeInteger(current)
-    || !Number.isSafeInteger(target)
-    || target <= current) return { prefix: current, carry: 0 };
-  const backlog = target - current;
-  if (backlog <= 4) return { prefix: current + 1, carry: 0 };
-  const elapsed = Math.max(0, Math.min(34, Number(elapsedMilliseconds) || 0));
-  const rate = Math.min(240, Math.max(60, backlog / 4));
-  const budget = Math.max(0, Number(carry) || 0) + elapsed * rate / 1000;
-  const step = Math.min(backlog, Math.floor(budget));
-  return {
-    prefix: current + step,
-    carry: step === backlog ? 0 : budget - step
-  };
-}
-
 export function estimateRemainingMilliseconds(job, now = Date.now()) {
   if (!record(job)
     || !["scan", "write"].includes(job.type)
@@ -754,6 +742,24 @@ export function chooseShownJob({ activeJob, selectedJob, modeJobs, fallbackJobs,
     || (Array.isArray(fallbackJobs) ? fallbackJobs[0] : null)
     || pendingJob
     || null;
+}
+
+export function activeJobForTarget(jobs, mode, disk, speedTarget) {
+  return (Array.isArray(jobs) ? jobs : []).find(job => ACTIVE_JOB_STATUSES.has(job?.status)
+    && (mode === "speed"
+      ? job.type === "speed" && jobBelongsToSpeedTarget(job, speedTarget)
+      : ["scan", "write"].includes(job.type) && jobBelongsToDisk(job, disk))) || null;
+}
+
+export function taskStartBlockedReason(jobs, mode, disk) {
+  const active = (Array.isArray(jobs) ? jobs : []).filter(job => ACTIVE_JOB_STATUSES.has(job?.status));
+  if (mode === "speed") return active.length ? "测速需等待其他检测任务结束" : "";
+  if (active.some(job => job.type !== "scan")) return "请等待测速或其他检测任务结束后再扫描";
+  if (active.some(job => job.device === disk?.path
+    || (text(job.disk?.serial) && text(job.disk?.serial) === text(disk?.serial)))) {
+    return "这块硬盘已有任务运行或正在停止，请等待任务结束";
+  }
+  return "";
 }
 
 export function detailRetryDelay(error, failedAttempt) {
@@ -888,6 +894,30 @@ export function isCompleteScanResult(job) {
     }
   }
   return true;
+}
+
+export function speedHistorySummary(job) {
+  if (job?.type !== "speed") return null;
+  const results = Array.isArray(job.result?.benchmarks) ? job.result.benchmarks : job.speedSummary?.benchmarks;
+  const valid = (Array.isArray(results) ? results : []).filter((benchmark) => record(benchmark)
+    && ["read", "write", "mixed"].includes(benchmark.operation)
+    && ["sequential", "random"].includes(benchmark.pattern)
+    && Number.isFinite(benchmark.averageMBps) && benchmark.averageMBps >= 0);
+  const pattern = valid.some((benchmark) => benchmark.pattern === "sequential") ? "sequential" : "random";
+  const primary = valid.filter((benchmark) => benchmark.pattern === pattern);
+  if (!primary.length) return null;
+  const read = primary.find((benchmark) => benchmark.operation === "read");
+  const write = primary.find((benchmark) => benchmark.operation === "write");
+  const mixed = primary.find((benchmark) => benchmark.operation === "mixed");
+  const rate = (benchmark) => benchmark ? `${benchmark.averageMBps.toLocaleString("zh-CN", { maximumFractionDigits: 1 })} MB/s` : "—";
+  const prefix = pattern === "sequential" ? "" : "随机";
+  const text = read || write ? `${prefix}读 ${rate(read)} · 写 ${rate(write)}` : `${prefix}混合 ${rate(mixed)}`;
+  const details = [read, write, ...(!read && !write ? [mixed] : [])].filter(Boolean).map((benchmark) => {
+    const block = Number.isSafeInteger(benchmark.blockSize) && benchmark.blockSize > 0
+      ? (benchmark.blockSize % 1048576 === 0 ? `${benchmark.blockSize / 1048576} MiB` : `${benchmark.blockSize / 1024} KiB`) : "块大小未记录";
+    return `${pattern === "sequential" ? "顺序" : "随机"}${{ read: "读取", write: "写入", mixed: "混合读写" }[benchmark.operation]} · ${block} Q${benchmark.queueDepth || 1}T${benchmark.threads || 1} · ${rate(benchmark)}`;
+  });
+  return { text, tooltip: details.join("\n") };
 }
 
 export function speedBenchmarkCells(job, rows) {

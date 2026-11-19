@@ -152,6 +152,7 @@ type StorageSpaceSnapshot struct {
 	Members    []string `json:"members"`
 	Size       int64    `json:"size"`
 	ReadOnly   bool     `json:"readOnly"`
+	IsSystem   bool     `json:"isSystem,omitempty"`
 }
 
 type JobOptions struct {
@@ -314,6 +315,19 @@ type SpeedResult struct {
 	SampleMiB  int64             `json:"sampleMiB"`
 	Runs       int64             `json:"runs"`
 	Benchmarks []BenchmarkResult `json:"benchmarks"`
+}
+
+type speedHistoryBenchmark struct {
+	Operation   string   `json:"operation"`
+	Pattern     string   `json:"pattern"`
+	BlockSize   int64    `json:"blockSize"`
+	QueueDepth  int64    `json:"queueDepth,omitempty"`
+	Threads     int64    `json:"threads,omitempty"`
+	AverageMBps *float64 `json:"averageMBps"`
+}
+
+type speedHistorySummary struct {
+	Benchmarks []speedHistoryBenchmark `json:"benchmarks"`
 }
 
 type Job struct {
@@ -640,7 +654,7 @@ func createSpeedPlan(diskSize int64, sampleMiB int64, speedPosition string) (Spe
 }
 
 func summarizeJobJSON(job *Job) map[string]interface{} {
-	return map[string]interface{}{
+	summary := map[string]interface{}{
 		"id":                  job.ID,
 		"type":                job.Type,
 		"device":              job.Device,
@@ -659,6 +673,17 @@ func summarizeJobJSON(job *Job) map[string]interface{} {
 		"resumeFrom":          job.ResumeFrom,
 		"resumeStartProgress": job.ResumeStartProgress,
 	}
+	if job.Type == "speed" && job.Result != nil {
+		// Reloaded history stores Result as a JSON map; live jobs use typed
+		// results. Decode only the measured rates and test parameters, keeping
+		// sample arrays out of the history-list response in either case.
+		encoded, err := json.Marshal(job.Result)
+		var speed speedHistorySummary
+		if err == nil && json.Unmarshal(encoded, &speed) == nil && len(speed.Benchmarks) > 0 {
+			summary["speedSummary"] = speed
+		}
+	}
+	return summary
 }
 
 func cloneBenchmarkResults(benchmarks []BenchmarkResult) []BenchmarkResult {
@@ -729,7 +754,6 @@ type JobManager struct {
 	logger           logger
 	mock             bool
 	stopped          bool
-	creating         bool
 	nextHistoryOrder int
 }
 
@@ -1034,19 +1058,10 @@ func (m *JobManager) appendLog(job *Job, message string) {
 	}
 }
 
-func (m *JobManager) activeJobLocked() *Job {
-	for _, job := range m.jobs {
-		if activeJobStatuses[job.Status] {
-			return job
-		}
-	}
-	return nil
-}
-
 func (m *JobManager) pruneHistoryLocked() {
 	var ordered []*Job
 	for _, job := range m.jobs {
-		if activeJobStatuses[job.Status] {
+		if m.jobBusyLocked(job) {
 			continue
 		}
 		ordered = append(ordered, job)
@@ -1177,7 +1192,7 @@ func (m *JobManager) remove(id string) error {
 	if !jobIDPattern.MatchString(id) || m.jobs[id] == nil {
 		return newJobError("任务不存在", "JOB_NOT_FOUND", 404)
 	}
-	if activeJobStatuses[m.jobs[id].Status] {
+	if m.jobBusyLocked(m.jobs[id]) {
 		return newJobError("运行中的任务不能删除", "JOB_ACTIVE", 409)
 	}
 	target := filepath.Join(m.jobsDir, id+".json")
@@ -1929,9 +1944,26 @@ func sameStrings(first, second []string) bool {
 }
 
 func storageIdentityChanged(expected *StorageSpaceSnapshot, current *StorageSpace) bool {
-	return expected == nil || current == nil || expected.Path != current.Path || expected.Source != current.Source ||
+	return expected == nil || current == nil || !isLocalStorageMount(current.Source, current.FileSystem) ||
+		(current.IsSystem && !systemBenchmarkPath(current.Path)) ||
+		expected.Path != current.Path || expected.Source != current.Source ||
 		expected.FileSystem != current.FileSystem || expected.Layout != current.Layout || expected.Size != current.Size ||
-		expected.ReadOnly != current.ReadOnly || !sameStrings(expected.Members, current.Members)
+		expected.ReadOnly != current.ReadOnly || expected.IsSystem != current.IsSystem || !sameStrings(expected.Members, current.Members)
+}
+
+func benchmarkSpaceCapacityError(space *StorageSpace, fileSize int64) error {
+	reserve := int64(64 * 1024 * 1024)
+	if space.IsSystem {
+		reserve = maxInt64(1024*1024*1024, space.Size/10)
+	}
+	if space.FreeBytes >= fileSize+reserve {
+		return nil
+	}
+	message := "存储空间可用容量不足以创建测速临时文件"
+	if space.IsSystem {
+		message = "系统盘空间不足：测速后需保留至少 1 GiB 且不少于总容量的 10%，请减小样本或释放空间"
+	}
+	return newJobError(message, "STORAGE_SPACE_FULL", 409)
 }
 
 func (m *JobManager) assertStorageIdentity(job *Job) (*StorageSpace, error) {
@@ -2134,18 +2166,7 @@ func (m *JobManager) create(typeName, devicePath string, options map[string]inte
 		m.mu.Unlock()
 		return nil, newJobError("应用服务已停止，无法创建任务", "SERVICE_STOPPED", 503)
 	}
-	if m.creating || m.activeJobLocked() != nil || len(m.handles) > 0 || len(m.cancels) > 0 {
-		m.mu.Unlock()
-		return nil, newJobError("已有任务正在运行，请等待完成或先取消", "JOB_CONFLICT", 409)
-	}
-	m.creating = true
 	m.mu.Unlock()
-
-	defer func() {
-		m.mu.Lock()
-		m.creating = false
-		m.mu.Unlock()
-	}()
 
 	var disk *Disk
 	var space *StorageSpace
@@ -2160,11 +2181,17 @@ func (m *JobManager) create(typeName, devicePath string, options map[string]inte
 	if err != nil {
 		return nil, err
 	}
+	candidate := &Job{Type: typeName, Device: devicePath}
+	if disk != nil {
+		candidate.Device, candidate.Disk.Serial = disk.Path, disk.Serial
+	} else if space != nil {
+		candidate.Device = space.Path
+	}
 	m.mu.Lock()
-	stopped := m.stopped
+	admissionErr := m.jobAdmissionErrorLocked(candidate)
 	m.mu.Unlock()
-	if stopped {
-		return nil, newJobError("应用服务已停止，无法创建任务", "SERVICE_STOPPED", 503)
+	if admissionErr != nil {
+		return nil, admissionErr
 	}
 	if scanSelfTest && (typeName != "scan" || disk == nil || !isNativeNVMe(*disk) || m.mock) {
 		return nil, newJobError("固件自检仅支持真实 NVMe 命名空间的只读扫描", "CAPABILITY_UNAVAILABLE", 400)
@@ -2172,6 +2199,12 @@ func (m *JobManager) create(typeName, devicePath string, options map[string]inte
 	if typeName == "speed" && speedTargetMode == "filesystem" {
 		if space == nil {
 			return nil, newJobError("存储空间不存在或未挂载，请刷新后重试", "STORAGE_SPACE_NOT_FOUND", 404)
+		}
+		if !isLocalStorageMount(space.Source, space.FileSystem) {
+			return nil, newJobError("仅支持本地存储空间测速，远程挂载不可用", "STORAGE_SPACE_NOT_LOCAL", 400)
+		}
+		if space.IsSystem && !systemBenchmarkPath(space.Path) {
+			return nil, newJobError("系统盘文件测速需要使用已核对的临时目录", "SYSTEM_SPEED_TARGET_INVALID", 409)
 		}
 		if space.Size <= 0 {
 			return nil, newJobError("存储空间容量信息无效，请刷新后重试", "STORAGE_SPACE_SIZE_INVALID", 409)
@@ -2308,8 +2341,10 @@ func (m *JobManager) create(typeName, devicePath string, options map[string]inte
 			return nil, newJobError("所选测速组合不存在", "INVALID_SPEED_COMBINATION", 400)
 		}
 		fileSize := sampleMiB * 1024 * 1024
-		if speedTargetMode == "filesystem" && space.FreeBytes > 0 && space.FreeBytes < fileSize+64*1024*1024 {
-			return nil, newJobError("存储空间可用容量不足以创建测速临时文件", "STORAGE_SPACE_FULL", 409)
+		if speedTargetMode == "filesystem" {
+			if err := benchmarkSpaceCapacityError(space, fileSize); err != nil {
+				return nil, err
+			}
 		}
 		targetSize := fileSize
 		if speedTargetMode == "raw" {
@@ -2422,6 +2457,7 @@ func (m *JobManager) create(typeName, devicePath string, options map[string]inte
 		diskSnapshot = DiskSnapshot{
 			Name: path.Base(space.Path), Model: strings.ToUpper(space.FileSystem), Size: space.Size,
 			LogicalSectorSize: 4096, PhysicalSectorSize: 4096,
+			IsSystem: space.IsSystem,
 		}
 	} else {
 		device = disk.Path
@@ -2458,6 +2494,13 @@ func (m *JobManager) create(typeName, devicePath string, options map[string]inte
 	}
 
 	m.mu.Lock()
+	// Admit jobs atomically after resolving their real device identity. Separate
+	// disks can scan together; a cancelled request owns its disk until I/O settles.
+	if err := m.jobAdmissionErrorLocked(job); err != nil {
+		m.mu.Unlock()
+		m.removeScanIssueFile(job.ID)
+		return nil, err
+	}
 	// The source may have been deleted while resolving the current disk.
 	if (resumeSource != nil && m.jobs[resumeID] == nil) || (repairSource != nil && m.jobs[repairFrom] == nil) {
 		m.mu.Unlock()
@@ -2562,6 +2605,9 @@ func storageSpaceFromMap(raw map[string]interface{}) *StorageSpace {
 	if v, ok := raw["readOnly"].(bool); ok {
 		space.ReadOnly = v
 	}
+	if v, ok := raw["isSystem"].(bool); ok {
+		space.IsSystem = v
+	}
 	return space
 }
 
@@ -2571,7 +2617,7 @@ func storageSnapshot(space *StorageSpace) StorageSpaceSnapshot {
 	}
 	return StorageSpaceSnapshot{
 		Path: space.Path, Source: space.Source, FileSystem: space.FileSystem, Layout: space.Layout,
-		Members: append([]string(nil), space.Members...), Size: space.Size, ReadOnly: space.ReadOnly,
+		Members: append([]string(nil), space.Members...), Size: space.Size, ReadOnly: space.ReadOnly, IsSystem: space.IsSystem,
 	}
 }
 
@@ -3357,8 +3403,14 @@ func (m *JobManager) runSpeed(job *Job, sampleMiB, runs int64, speedPosition, sp
 		if _, err := m.assertRawSpeedIdentity(job); err != nil {
 			return err
 		}
-	} else if _, err := m.assertStorageIdentity(job); err != nil {
-		return err
+	} else {
+		space, err := m.assertStorageIdentity(job)
+		if err != nil {
+			return err
+		}
+		if err := benchmarkSpaceCapacityError(space, sampleMiB*1024*1024); err != nil {
+			return err
+		}
 	}
 	if trimBefore && !rawTarget {
 		if err := m.trimStorageSpace(job, cancel.ctx); err != nil {
@@ -3699,6 +3751,7 @@ func (m *JobManager) awaitOpenBenchmark(job *Job, directIO bool) (WriteHandle, s
 			r := <-ch
 			if r.handle != nil {
 				m.closeHandle(r.handle)
+				_ = os.Remove(temporaryPath)
 			}
 		}()
 		return nil, temporaryPath, errCancelled

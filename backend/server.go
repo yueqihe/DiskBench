@@ -154,7 +154,15 @@ func defaultMockSpaces(disks []Disk) []StorageSpace {
 			}
 		}
 	}
-	return deriveStorageSpaces(disks, mounts)
+	spaces := deriveStorageSpaces(disks, mounts)
+	for _, disk := range disks {
+		if disk.IsSystem {
+			spaces = append(spaces, StorageSpace{Path: "/tmp", Source: disk.Path, FileSystem: "ext4", Layout: "single",
+				Members: []string{disk.Path}, Size: disk.Size, FreeBytes: disk.Size / 2, IsSystem: true})
+			break
+		}
+	}
+	return spaces
 }
 
 func (a *apiServer) applyHeaders(w http.ResponseWriter) {
@@ -655,6 +663,7 @@ func (a *apiServer) handleApi(w http.ResponseWriter, r *http.Request, pathname s
 	case pathname == "/api/disks":
 		var disks []Disk
 		var spaces []StorageSpace
+		storageWarning := ""
 		if a.mockDev {
 			disks = a.mockDisks
 			spaces = defaultMockSpaces(disks)
@@ -669,11 +678,15 @@ func (a *apiServer) handleApi(w http.ResponseWriter, r *http.Request, pathname s
 			spaces, err = a.listSpacesFn(disks, a.findExecutableFn)
 			if err != nil {
 				a.logger.Errorf("[diskbench] list storage spaces failed: %v", err)
-				a.apiError(w, newJobError("服务器内部错误", "INTERNAL_ERROR", 500))
-				return
+				spaces = []StorageSpace{}
+				storageWarning = "暂时无法读取存储空间，可继续扫描物理磁盘；文件测速请稍后刷新重试。"
 			}
 		}
-		a.json(w, 200, map[string]interface{}{"disks": disks, "storageSpaces": spaces})
+		inventory := map[string]interface{}{"disks": disks, "storageSpaces": spaces}
+		if storageWarning != "" {
+			inventory["storageWarning"] = storageWarning
+		}
+		a.json(w, 200, inventory)
 		return
 
 	case pathname == "/api/jobs" && r.Method == "GET":

@@ -33,21 +33,21 @@ function initialTheme(preference, systemDark = false, storageUnavailable = false
 
 test("new installations follow the system theme before the UI loads", () => {
   assert.deepEqual(initialTheme(null), {
-    theme: "light", colorScheme: "light", themeColor: "#f6f7f9"
+    theme: "light", colorScheme: "light", themeColor: "#e4e8ed"
   });
   assert.deepEqual(initialTheme(null, true), {
-    theme: "dark", colorScheme: "dark", themeColor: "#1c1d20"
+    theme: "dark", colorScheme: "dark", themeColor: "#17191d"
   });
   assert.deepEqual(initialTheme(null, true, true), {
-    theme: "dark", colorScheme: "dark", themeColor: "#1c1d20"
+    theme: "dark", colorScheme: "dark", themeColor: "#17191d"
   });
 });
 
-test("an explicit theme choice overrides the system theme", () => {
+test("legacy saved choices do not block following the system theme", () => {
   assert.deepEqual(initialTheme("light", true), {
-    theme: "light", colorScheme: "light", themeColor: "#f6f7f9"
+    theme: "dark", colorScheme: "dark", themeColor: "#17191d"
   });
   assert.deepEqual(initialTheme("dark", false), {
-    theme: "dark", colorScheme: "dark", themeColor: "#1c1d20"
+    theme: "light", colorScheme: "light", themeColor: "#e4e8ed"
   });
 });

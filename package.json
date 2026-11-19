@@ -20,6 +20,7 @@
     "test": "node --test backend/test/*.test.js && node scripts/test-go.js"
   },
   "devDependencies": {
+    "@resvg/resvg-js": "2.6.2",
     "cross-env": "^7.0.3"
   }
 }

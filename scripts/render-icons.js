@@ -1,108 +1,119 @@
 "use strict";
 
-const { spawnSync } = require("child_process");
-const fs = require("fs");
-const os = require("os");
-const path = require("path");
+const fs = require("node:fs");
+const path = require("node:path");
+const { Resvg } = require("@resvg/resvg-js");
 
 const root = path.resolve(__dirname, "..");
-const source = path.join(root, "assets", "icon-source.svg");
-const packageDir = path.join(root, "package", "diskbench");
-const outputDir = path.join(root, "package", "diskbench", "app", "ui", "images");
-const frontendPublicDir = path.join(root, "frontend", "public");
-const edge = process.platform === "win32"
-  ? "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe"
-  : "microsoft-edge";
+const source = fs.readFileSync(path.join(root, "assets/icon-source.svg"), "utf8");
+const packageDir = path.join(root, "package/diskbench");
+const outputDir = path.join(packageDir, "app/ui/images");
+const frontendPublicDir = path.join(root, "frontend/public");
+const frameCount = 80;
+const frameMilliseconds = 50;
+const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
 
-function waitForStableFile(filePath, timeoutMs = 10000) {
-  const startedAt = Date.now();
-  let previousSize = -1;
-  let stableChecks = 0;
-  while (Date.now() - startedAt < timeoutMs) {
-    if (fs.existsSync(filePath)) {
-      const size = fs.statSync(filePath).size;
-      if (size > 0 && size === previousSize) stableChecks += 1;
-      else stableChecks = 0;
-      previousSize = size;
-      if (stableChecks >= 5) return true;
-    }
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+const crcTable = Array.from({ length: 256 }, (_, value) => {
+  for (let bit = 0; bit < 8; bit++) value = value & 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1;
+  return value >>> 0;
+});
+
+function chunk(type, data) {
+  const name = Buffer.from(type, "ascii");
+  let crc = 0xffffffff;
+  for (const buffer of [name, data]) {
+    for (const byte of buffer) crc = crcTable[(crc ^ byte) & 255] ^ (crc >>> 8);
   }
-  return false;
+  const result = Buffer.alloc(data.length + 12);
+  result.writeUInt32BE(data.length, 0);
+  name.copy(result, 4);
+  data.copy(result, 8);
+  result.writeUInt32BE((crc ^ 0xffffffff) >>> 0, data.length + 8);
+  return result;
 }
 
-function makeRoundedCornersTransparent(output, size) {
-  if (process.platform !== "win32") return;
-  const escaped = output.replace(/'/g, "''");
-  const script = `
-Add-Type -AssemblyName System.Drawing
-$path = '${escaped}'
-$source = [System.Drawing.Bitmap]::FromFile($path)
-$bitmap = New-Object System.Drawing.Bitmap($source.Width, $source.Height, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
-$graphics = [System.Drawing.Graphics]::FromImage($bitmap)
-$graphics.DrawImageUnscaled($source, 0, 0)
-$graphics.Dispose()
-$source.Dispose()
-$radius = ${size} * 43.0 / 256.0
-for ($y = 0; $y -lt ${size}; $y++) {
-  for ($x = 0; $x -lt ${size}; $x++) {
-    $dx = 0.0
-    $dy = 0.0
-    if ($x -lt $radius) { $dx = $radius - $x }
-    elseif ($x -ge ${size} - $radius) { $dx = $x - (${size} - $radius - 1) }
-    if ($y -lt $radius) { $dy = $radius - $y }
-    elseif ($y -ge ${size} - $radius) { $dy = $y - (${size} - $radius - 1) }
-    if (($dx -gt 0) -and ($dy -gt 0) -and (($dx * $dx + $dy * $dy) -gt ($radius * $radius))) {
-      $pixel = $bitmap.GetPixel($x, $y)
-      $bitmap.SetPixel($x, $y, [System.Drawing.Color]::FromArgb(0, $pixel.R, $pixel.G, $pixel.B))
-    }
+function pngParts(png) {
+  if (!png.subarray(0, 8).equals(signature)) throw new Error("Invalid rendered PNG");
+  const parts = { image: [] };
+  for (let offset = 8; offset < png.length;) {
+    const length = png.readUInt32BE(offset);
+    const type = png.toString("ascii", offset + 4, offset + 8);
+    const data = png.subarray(offset + 8, offset + 8 + length);
+    if (type === "IHDR") parts.header = data;
+    if (type === "IDAT") parts.image.push(data);
+    offset += length + 12;
   }
-}
-$bitmap.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
-$bitmap.Dispose()
-`;
-  const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { stdio: "inherit" });
-  if (result.status !== 0) throw new Error(`处理 ${size}x${size} 图标透明角失败`);
+  if (!parts.header || !parts.image.length) throw new Error("Incomplete rendered PNG");
+  return parts;
 }
 
-if (!fs.existsSync(source)) throw new Error("找不到 assets/icon-source.svg");
-if (process.platform === "win32" && !fs.existsSync(edge)) throw new Error("找不到 Microsoft Edge，无法生成应用图标");
+function animatedPng(still, frames) {
+  const base = pngParts(still);
+  const control = Buffer.alloc(8);
+  control.writeUInt32BE(frames.length, 0);
+  // A separate default image lets non-APNG decoders display the complete logo.
+  // Loop count 0 means repeat indefinitely; every frame fully replaces the canvas.
+  const chunks = [signature, chunk("IHDR", base.header), chunk("sRGB", Buffer.from([0])), chunk("acTL", control)];
+  for (const data of base.image) chunks.push(chunk("IDAT", data));
+  let sequence = 0;
+  for (const frame of frames) {
+    const parts = pngParts(frame);
+    if (!parts.header.equals(base.header)) throw new Error("Animation frame format mismatch");
+    const frameControl = Buffer.alloc(26);
+    frameControl.writeUInt32BE(sequence++, 0);
+    base.header.copy(frameControl, 4, 0, 8);
+    frameControl.writeUInt16BE(frameMilliseconds, 20);
+    frameControl.writeUInt16BE(1000, 22);
+    chunks.push(chunk("fcTL", frameControl));
+    const frameData = Buffer.alloc(4);
+    frameData.writeUInt32BE(sequence++, 0);
+    chunks.push(chunk("fdAT", Buffer.concat([frameData, ...parts.image])));
+  }
+  chunks.push(chunk("IEND", Buffer.alloc(0)));
+  const result = Buffer.concat(chunks);
+  if (result.length > 1024 * 1024) throw new Error("Animated icon exceeds fnOS's 1024 KB limit");
+  return result;
+}
 
+function animationFrame(index) {
+  const phase = index / frameCount;
+  const progress = Math.max(0, Math.min(1, (phase - .1) / .8));
+  const opacity = Math.sin(Math.PI * progress) ** 2;
+  const scanY = 5.2 + 6.1 * progress;
+  const breathe = (1 - Math.cos(phase * 2 * Math.PI)) / 2;
+  const activity = `
+    <defs>
+      <clipPath id="scan-face"><path d="M7.24 5H16.76L19.75 10.9H4.25Z"/></clipPath>
+      <linearGradient id="scan-light"><stop stop-color="#8db9e9" stop-opacity="0"/><stop offset=".5" stop-color="#a9cff9"/><stop offset="1" stop-color="#8db9e9" stop-opacity="0"/></linearGradient>
+    </defs>
+    <g clip-path="url(#scan-face)" opacity="${opacity.toFixed(4)}" stroke="none">
+      <rect x="3" y="${(scanY - 1.1).toFixed(4)}" width="18" height="2.2" fill="url(#scan-light)" opacity=".12"/>
+      <rect x="3" y="${(scanY - .17).toFixed(4)}" width="18" height=".34" fill="url(#scan-light)"/>
+    </g>`;
+  return source.replace("<!-- activity -->", activity)
+    .replace('id="status-led-1"', `id="status-led-1" stroke-opacity="${(1 - .4 * breathe).toFixed(4)}"`)
+    .replace('id="status-led-2"', `id="status-led-2" stroke-opacity="${(.6 + .4 * breathe).toFixed(4)}"`);
+}
+
+function render(svg, size) {
+  return new Resvg(svg, { fitTo: { mode: "width", value: size }, font: { loadSystemFonts: false } }).render().asPng();
+}
+
+if (!source.includes("<!-- activity -->")) throw new Error("Missing icon activity layer");
 fs.mkdirSync(outputDir, { recursive: true });
 fs.mkdirSync(frontendPublicDir, { recursive: true });
-const profileRoot = fs.mkdtempSync(path.join(os.tmpdir(), "diskbench-icon-"));
-const sourceSvg = fs.readFileSync(source, "utf8");
-
-try {
-  for (const size of [64, 256]) {
-    const output = path.join(outputDir, `icon_${size}.png`);
-    const renderSource = path.join(profileRoot, `icon_${size}.svg`);
-    fs.writeFileSync(renderSource, sourceSvg.replace('width="256" height="256"', `width="${size}" height="${size}"`));
-    const sourceUrl = `file:///${renderSource.replace(/\\/g, "/")}`;
-    fs.rmSync(output, { force: true });
-    const result = spawnSync(edge, [
-      "--headless", "--disable-gpu", "--no-sandbox", "--hide-scrollbars",
-      "--default-background-color=00000000",
-      `--user-data-dir=${path.join(profileRoot, String(size))}`,
-      `--screenshot=${output}`, `--window-size=${size},${size}`, sourceUrl
-    ], { stdio: "inherit" });
-    if (result.status !== 0 || !waitForStableFile(output)) throw new Error(`生成 ${size}x${size} 图标失败`);
-    makeRoundedCornersTransparent(output, size);
-  }
-
-  // fnOS also enlarges ICON.PNG in the app detail view. Use the 256px
-  // rendering there so its edges stay sharp at the larger display size.
-  fs.copyFileSync(path.join(outputDir, "icon_256.png"), path.join(packageDir, "ICON.PNG"));
-  fs.copyFileSync(path.join(outputDir, "icon_256.png"), path.join(packageDir, "ICON_256.PNG"));
-  fs.copyFileSync(path.join(outputDir, "icon_64.png"), path.join(frontendPublicDir, "favicon.png"));
-} finally {
-  // Edge can briefly retain profile files after the headless process exits.
-  // The directory is already isolated under the operating-system temp path.
-  try {
-    fs.rmSync(profileRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
-  } catch (error) {
-    if (error.code !== "EPERM" && error.code !== "EBUSY") throw error;
-  }
+for (const size of [64, 256]) {
+  const still = render(source, size);
+  const frames = Array.from({ length: frameCount }, (_, index) => render(animationFrame(index), size));
+  const icon = animatedPng(still, frames);
+  fs.writeFileSync(path.join(outputDir, `icon_${size}.png`), icon);
+  // Keep the browser tab favicon still; only fnOS launcher/package icons animate.
+  if (size === 64) fs.writeFileSync(path.join(frontendPublicDir, "favicon.png"), still);
+  console.log(`Rendered ${size}px APNG: ${frameCount} frames, ${frameCount * frameMilliseconds} ms, ${icon.length} bytes`);
 }
 
-console.log(`Rendered desktop and installer icons in ${packageDir}`);
+// Preserve the high-resolution package icon used by fnOS's app detail view.
+for (const filename of ["ICON.PNG", "ICON_256.PNG"]) {
+  fs.copyFileSync(path.join(outputDir, "icon_256.png"), path.join(packageDir, filename));
+}
+console.log(`Rendered animated desktop and installer icons in ${packageDir}`);
