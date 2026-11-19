@@ -1,5 +1,5 @@
 appname=diskbench
-version=0.1.32
+version=0.1.33
 display_name=Disk Bench
 desc=fnOS 硬盘健康与性能检测工具，支持 SMART 信息、快速与全盘扫描、异常扇区定位、扫描续跑、检测报告和顺序／随机读写测速。兼容 HDD、SATA SSD、NVMe SSD，数据保存在本机。
 source=thirdparty
@@ -15,4 +15,4 @@ os_min_version=1.1.3100
 ctl_stop=true
 checkport=false
 disable_authorization_path=true
-changelog=修复删除历史记录后历史窗口关闭的问题；新增带红色指示灯的动态应用图标，兼容静态显示；测速当前项目改为圆点动画，使用默认大小并跟随浅色、深色主题配色。
+changelog=放大应用图标中的硬盘主体；两颗红色指示灯改为独立的不规则快速闪烁，模拟读写活动；保留扫描光线动画和静态图标兼容。

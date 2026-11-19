@@ -13,6 +13,27 @@ const frameCount = 80;
 const frameMilliseconds = 50;
 const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
 
+function activityLevels(seed) {
+  // Fixed seeds keep builds reproducible while giving each LED an irregular
+  // pattern of short flashes, short gaps and occasional idle pauses.
+  const random = () => {
+    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+    return seed / 0x100000000;
+  };
+  const levels = [];
+  let lit = false;
+  while (levels.length < frameCount) {
+    const duration = lit ? 1 + Math.floor(random() * 2)
+      : random() < .2 ? 5 + Math.floor(random() * 4) : 1 + Math.floor(random() * 3);
+    const opacity = lit ? .8 + random() * .2 : .14;
+    for (let frame = 0; frame < duration && levels.length < frameCount; frame++) levels.push(opacity);
+    lit = !lit;
+  }
+  return levels;
+}
+
+const ledActivity = [activityLevels(0x6d2b79f5), activityLevels(0x1b873593)];
+
 const crcTable = Array.from({ length: 256 }, (_, value) => {
   for (let bit = 0; bit < 8; bit++) value = value & 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1;
   return value >>> 0;
@@ -80,7 +101,6 @@ function animationFrame(index) {
   const progress = Math.max(0, Math.min(1, (phase - .1) / .8));
   const opacity = Math.sin(Math.PI * progress) ** 2;
   const scanY = 5.2 + 6.1 * progress;
-  const breathe = (1 - Math.cos(phase * 2 * Math.PI)) / 2;
   const activity = `
     <defs>
       <clipPath id="scan-face"><path d="M7.24 5H16.76L19.75 10.9H4.25Z"/></clipPath>
@@ -91,8 +111,8 @@ function animationFrame(index) {
       <rect x="3" y="${(scanY - .17).toFixed(4)}" width="18" height=".34" fill="url(#scan-light)"/>
     </g>`;
   return source.replace("<!-- activity -->", activity)
-    .replace('id="status-led-1"', `id="status-led-1" stroke-opacity="${(1 - .4 * breathe).toFixed(4)}"`)
-    .replace('id="status-led-2"', `id="status-led-2" stroke-opacity="${(.6 + .4 * breathe).toFixed(4)}"`);
+    .replace('id="status-led-1"', `id="status-led-1" stroke-opacity="${ledActivity[0][index].toFixed(4)}"`)
+    .replace('id="status-led-2"', `id="status-led-2" stroke-opacity="${ledActivity[1][index].toFixed(4)}"`);
 }
 
 function render(svg, size) {

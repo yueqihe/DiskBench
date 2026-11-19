@@ -93,7 +93,7 @@ npm run fpk:arm64
 
 两架构共享打包目录，应依次构建。构建使用 `-trimpath` 并去除调试信息及本机 Git 元数据。fnOS 需提供 lsblk、findmnt、dd；启用 TRIM 还需 fstrim。
 
-`npm run build:icons` 从 `assets/icon-source.svg` 生成 PNG 格式的 APNG 动态包图标和桌面图标：4 秒循环、20 帧/秒，包含独立静态首图。不支持 APNG 的显示组件会显示静态图标；具体 fnOS 界面是否播放由宿主决定。浏览器标签图标保持静态。图标由构建依赖 `@resvg/resvg-js` 渲染，无需启动浏览器。
+`npm run build:icons` 从 `assets/icon-source.svg` 生成 PNG 格式的 APNG 动态包图标和桌面图标：4 秒循环、20 帧/秒，包含独立静态首图。硬盘主体放大显示，两颗红色指示灯以独立的不规则快闪模拟读写活动；动画不代表真实磁盘状态。不支持 APNG 的显示组件会显示静态图标；具体 fnOS 界面是否播放由宿主决定。浏览器标签图标保持静态。图标由构建依赖 `@resvg/resvg-js` 渲染，无需启动浏览器。
 
 ## 第三方组件与发布材料
 
