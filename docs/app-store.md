@@ -62,6 +62,6 @@ Disk Bench 是一款为飞牛 fnOS 设计的硬盘健康与性能检测工具，
 ## 提交附件
 
 - 分别上传与架构对应的 FPK，勿混用旧版本安装包。
-- 使用 `assets/diskbench-preview.png`、`assets/diskbench-speed-preview.png` 展示当前界面；截图使用演示数据。
+- 使用[坏道扫描截图](../assets/diskbench-preview.png)和[磁盘测速截图](../assets/diskbench-speed-preview.png)展示当前界面。
 - 与 FPK 下载同时提供 `diskbench-third-party-sources-<版本>.tar.gz`，保持下载权限一致；该附件仅为随包第三方工具的源码、补丁及构建配方。
 - 包内 `server/THIRD_PARTY_NOTICES.txt` 和 `server/licenses/` 提供组件声明与许可证全文。

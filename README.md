@@ -2,7 +2,15 @@
 
 为飞牛 fnOS 设计的硬盘健康与性能检测工具，支持 HDD、SATA SSD 和 NVMe SSD。集中查看 SMART 信息、扫描异常区域、测试读写性能，并在本机保存检测历史和报告。
 
-![Disk Bench 深色界面（演示数据）](assets/diskbench-preview.png)
+## 界面截图
+
+**坏道扫描**
+
+![Disk Bench 坏道扫描界面，显示扫描块图、读取量和异常区域统计](assets/diskbench-preview.png)
+
+**磁盘测速**
+
+![Disk Bench 磁盘测速界面，显示顺序与随机读写的速度和 IOPS](assets/diskbench-speed-preview.png)
 
 ## 主要功能
 
