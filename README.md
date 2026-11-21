@@ -36,6 +36,8 @@
 | x86_64 | 安装文件名含 `x86_64` 的 FPK |
 | ARM64 | 安装文件名含 `arm64` 的 FPK |
 
+可在 [GitHub Releases](https://github.com/yueqihe/DiskBench/releases) 下载已发布的安装包。
+
 在 fnOS 应用中心选择“手动安装”，上传对应架构的 `.fpk`。核对名称 **Disk Bench**、开发者 **情深深雨蒙蒙** 后安装，从桌面打开即可，无需 Docker、端口配置或另外安装 fio、smartctl。
 
 后续版本使用相同应用 ID `diskbench`，可直接升级并保留历史。更新前先停止任务；升级不会自动开始扫描或测速。早期 `FN Smart`、`FN Drive Lab`、`fn-diskscan` 使用不同应用 ID，不支持直接覆盖或自动迁移记录。
@@ -91,27 +93,30 @@
 需要 Node.js 22、Go 1.22+ 和 fnpack。后端使用 Go 标准库，发布版不需要 Node.js。
 
 ```bash
-npm install
+npm ci
 npm test
 npm run demo
 ```
 
 演示页面：`http://127.0.0.1:5050/app/diskbench/`。演示只使用模拟数据，开发模式仅供本机预览；安装包启动时明确关闭开发与演示开关。
 
+建议在 Linux 或 WSL 内构建 FPK。使用 WSL 时，把仓库放在 Linux 文件系统中（例如 `~/DiskBench`），并在 WSL 内安装 Node.js 和 Go。以下命令构建用于本地调试的未签名 FPK：
+
 ```bash
-npm run fpk:amd64
-npm run fpk:arm64
+node scripts/download-fnpack.js
+npm run fpk:amd64 -- --nosign
+npm run fpk:arm64 -- --nosign
 ```
 
-两架构共享打包目录，应依次构建。构建使用 `-trimpath` 并去除调试信息及本机 Git 元数据。fnOS 需提供 lsblk、findmnt、dd；启用 TRIM 还需 fstrim。
+两架构共享打包目录，应依次构建。需要签名时，可用 `node scripts/fnpack.js cert import -key /path/to/developer.key -crt /path/to/developer.crt` 导入自己的飞牛开发者证书和私钥，或设置环境变量 `FNPACK_KEY` 与 `FNPACK_CERT`，然后去掉 `-- --nosign` 执行打包。签名材料应保存在应用打包目录及 Git 仓库之外；本仓库不发布带开发者证书的 FPK。构建使用 `-trimpath` 并去除调试信息及本机 Git 元数据。fnOS 需提供 lsblk、findmnt、dd；启用 TRIM 还需 fstrim。
 
 `npm run build:icons` 从 `assets/icon-source.svg` 生成 PNG 格式的 APNG 动态包图标和桌面图标：4 秒循环、20 帧/秒，包含独立静态首图。硬盘主体放大显示，两颗红色指示灯以独立的不规则快闪模拟读写活动；动画不代表真实磁盘状态。不支持 APNG 的显示组件会显示静态图标；具体 fnOS 界面是否播放由宿主决定。浏览器标签图标保持静态。图标由构建依赖 `@resvg/resvg-js` 渲染，无需启动浏览器。
 
 ## 第三方组件与发布材料
 
-Disk Bench 自身使用 MIT 许可证；fio、smartmontools 和相关运行库保留各自许可证，不属于该 MIT 授权。许可证全文与组件说明随安装包提供，详见 [第三方组件说明](runtime-deps/THIRD_PARTY.md)。
+Disk Bench 自身使用 [MIT 许可证](LICENSE)；fio、smartmontools 和相关运行库保留各自许可证，不属于该 MIT 授权。许可证全文与组件说明随安装包提供，详见 [第三方组件说明](runtime-deps/THIRD_PARTY.md)。
 
-发布 FPK 时，需同时提供对应的第三方源码附件下载。源码附件包含上游源码、Alpine 补丁和构建配方，不含本项目私有源码。制作方式见 [运行依赖说明](runtime-deps/README.md)。
+发布 FPK 时，需同时提供对应的第三方源码附件下载。该附件包含上游源码、Alpine 补丁和构建配方；Disk Bench 源码直接在本仓库维护。制作方式见 [运行依赖说明](runtime-deps/README.md)。
 
 上架可用的简介、功能说明与隐私说明见 [应用介绍](docs/app-store.md)。
 

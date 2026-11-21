@@ -2,7 +2,7 @@
   ".url": {
     "diskbench.main": {
       "title": "Disk Bench",
-      "icon": "images/icon_256.png",
+      "icon": "images/icon_{0}.png",
       "type": "iframe",
       "protocol": "",
       "gatewayPrefix": "/app/diskbench",

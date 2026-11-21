@@ -132,8 +132,7 @@ for (const size of [64, 256]) {
   console.log(`Rendered ${size}px APNG: ${frameCount} frames, ${frameCount * frameMilliseconds} ms, ${icon.length} bytes`);
 }
 
-// Preserve the high-resolution package icon used by fnOS's app detail view.
-for (const filename of ["ICON.PNG", "ICON_256.PNG"]) {
-  fs.copyFileSync(path.join(outputDir, "icon_256.png"), path.join(packageDir, filename));
+for (const [size, filename] of [[64, "ICON.PNG"], [256, "ICON_256.PNG"]]) {
+  fs.copyFileSync(path.join(outputDir, `icon_${size}.png`), path.join(packageDir, filename));
 }
 console.log(`Rendered animated desktop and installer icons in ${packageDir}`);

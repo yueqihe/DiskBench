@@ -30,6 +30,15 @@ backend/fn-diskscan.exe
 !.env.example
 *.pem
 *.key
+*.csr
+*.crt
+*.cer
+*.der
+*.p12
+*.pfx
+*.p7b
+*.p7c
+/.fnos-signing/
 /.ssh/
 /DG/
 /HD/

@@ -4,11 +4,15 @@ Run after building both architectures. This only reads packages and writes a
 local audit report; it never starts the app or performs disk tests.
 """
 
+import base64
 import hashlib
 import io
 import json
+import os
 import pathlib
 import re
+import ssl
+import struct
 import tarfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -21,6 +25,7 @@ OUTER_FILES = {
     "cmd/uninstall_init", "cmd/upgrade_callback", "cmd/upgrade_init",
     "config/privilege", "config/resource", "wizard/uninstall",
 }
+SIGNING_FILES = {"META-INF/checksums.json", "META-INF/developer.crt", "META-INF/signature.json"}
 LICENSE_FILES = {
     "fio-COPYING.txt", "fio-MORAL-LICENSE.txt", "go-LICENSE.txt",
     "gcc-COPYING.txt", "gcc-COPYING3.txt", "gcc-COPYING.LIB.txt",
@@ -61,6 +66,45 @@ def fields(text):
     return dict(tuple(part.strip() for part in line.split("=", 1)) for line in text.decode("utf-8").splitlines() if "=" in line)
 
 
+def verify_signing_metadata(outer):
+    checksums = json.loads(outer["META-INF/checksums.json"])
+    signature = json.loads(outer["META-INF/signature.json"])
+    require(checksums["version"] == 1 and checksums["hash"] == "sha256", "Unsupported fnpack checksum format")
+    digests = {entry["path"]: entry["sha256"] for entry in checksums["files"]}
+    expected = {name: hashlib.sha256(outer[name]).hexdigest() for name in OUTER_FILES}
+    require(len(checksums["files"]) == len(digests) and digests == expected, "Signed package checksums do not match")
+    certificate = outer["META-INF/developer.crt"]
+    cert_der = ssl.PEM_cert_to_DER_cert(certificate.decode("ascii").strip())
+    require(signature["certificate_sha256"] == hashlib.sha256(cert_der).hexdigest(), "Certificate fingerprint mismatch")
+    require(signature["version"] == 1 and signature["algorithm"] == "RSA-SHA256", "Unsupported fnpack signature format")
+    require(base64.b64decode(signature["signature"], validate=True), "Missing signature")
+    if cert_path := os.environ.get("FNPACK_CERT"):
+        require(certificate == pathlib.Path(cert_path).read_bytes(), "FPK contains an unexpected developer certificate")
+
+
+def verify_apng(data, size, name):
+    require(data[:8] == b"\x89PNG\r\n\x1a\n" and data[12:16] == b"IHDR", "Invalid PNG: " + name)
+    require(struct.unpack_from(">II", data, 16) == (size, size), "Wrong icon dimensions: " + name)
+    require(len(data) <= 1024 * 1024, "Icon exceeds 1 MiB: " + name)
+    frames = declared_frames = 0
+    for offset in png_chunks(data):
+        kind = data[offset + 4:offset + 8]
+        if kind == b"acTL":
+            declared_frames = struct.unpack_from(">I", data, offset + 8)[0]
+        elif kind == b"fcTL":
+            frames += 1
+    require(frames == declared_frames and frames > 1, "Missing animation frames: " + name)
+
+
+def png_chunks(data):
+    offset = 8
+    while offset + 12 <= len(data):
+        end = offset + struct.unpack_from(">I", data, offset)[0] + 12
+        require(end <= len(data), "Truncated PNG chunk")
+        yield offset
+        offset = end
+
+
 def elf_sections(data):
     offset = int.from_bytes(data[40:48], "little")
     entry_size = int.from_bytes(data[58:60], "little")
@@ -76,14 +120,16 @@ def elf_sections(data):
 def audit_fpk(arch, label, platform, machine):
     fpk = ROOT / f"diskbench-{label}-{VERSION}.fpk"
     outer = archive_files(fpk.read_bytes())
-    require(outer.keys() == OUTER_FILES, "Unexpected outer files: " + str(set(outer) ^ OUTER_FILES))
+    expected_outer = OUTER_FILES | SIGNING_FILES
+    require(outer.keys() == expected_outer, "Unexpected outer files: " + str(set(outer) ^ expected_outer))
+    verify_signing_metadata(outer)
     manifest = fields(outer["manifest"])
     require(manifest["version"] == VERSION and manifest["platform"] == platform, "Wrong version/platform")
     require(manifest["maintainer"] == manifest["distributor"] == "情深深雨蒙蒙", "Wrong developer")
     require(manifest["maintainer_url"] == manifest["distributor_url"] == "https://github.com/yueqihe", "Wrong developer URL")
     require(hashlib.md5(outer["app.tgz"]).hexdigest() == manifest["checksum"], "App checksum mismatch")
     for name, data in outer.items():
-        if name not in {"manifest", "app.tgz"}:
+        if name not in {"manifest", "app.tgz"} | SIGNING_FILES:
             require(data == (PACKAGE / name).read_bytes(), "Stale outer file: " + name)
 
     payload = archive_files(outer["app.tgz"])
@@ -111,6 +157,12 @@ def audit_fpk(arch, label, platform, machine):
     require(payload.keys() == expected.keys() | {"server/diskbench"}, "Unexpected payload files: " + str(set(payload) ^ (expected.keys() | {"server/diskbench"})))
     for name, data in expected.items():
         require(payload[name] == data, "Stale payload file: " + name)
+    entry_icon = json.loads(payload["ui/config"])[".url"]["diskbench.main"]["icon"]
+    require(entry_icon == "images/icon_{0}.png", "Application entry does not select icons by size")
+    for size, filename in ((64, "ICON.PNG"), (256, "ICON_256.PNG")):
+        verify_apng(outer[filename], size, filename)
+        name = "ui/" + entry_icon.format(size)
+        verify_apng(payload[name], size, name)
     elf_files = []
     for name, data in payload.items():
         if data.startswith(b"\x7fELF"):
@@ -132,7 +184,7 @@ def audit_fpk(arch, label, platform, machine):
         "file": fpk.name, "version": VERSION, "architecture": arch, "bytes": fpk.stat().st_size,
         "sha256": hashlib.sha256(fpk.read_bytes()).hexdigest(), "outerFileCount": len(outer),
         "payloadFileCount": len(payload), "elfFileCount": len(elf_files),
-        "licenseFileCount": len(LICENSE_FILES), "checks": "PASS",
+        "licenseFileCount": len(LICENSE_FILES), "signed": True, "checks": "PASS",
     }
 
 
@@ -167,7 +219,7 @@ def main():
     report = {
         "packages": [audit_fpk("amd64", "x86_64", "x86", 62), audit_fpk("arm64", "arm64", "arm", 183)],
         "thirdPartySources": audit_sources(),
-        "scope": "Exact file allowlist, current static assets/runtime/licenses, manifest, checksums, ELF architectures, build privacy flags, credential patterns and source archive hashes. No hardware I/O performed.",
+        "scope": "Exact file allowlist, current static assets/runtime/licenses, APNG dimensions and frames, fnpack signature metadata and signed checksums, ELF architectures, build privacy flags, credential patterns and source archive hashes. No NAS installation or hardware I/O performed.",
     }
     destination = ROOT / ".tools" / f"release-{VERSION}-content-audit.json"
     destination.parent.mkdir(parents=True, exist_ok=True)

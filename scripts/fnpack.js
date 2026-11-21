@@ -24,5 +24,27 @@ if (!fnpack) {
   process.exit(1);
 }
 
-const result = spawnSync(fnpack, process.argv.slice(2), { cwd: root, stdio: "inherit" });
-process.exit(result.status == null ? 1 : result.status);
+const args = process.argv.slice(2);
+if (args[0] === "build") {
+  const help = spawnSync(fnpack, ["build", "--help"], { encoding: "utf8" });
+  if (help.status !== 0 || !help.stdout.includes("--nosign")) {
+    console.error("This project requires a signing-capable fnpack. Run node scripts/download-fnpack.js first.");
+    process.exit(1);
+  }
+  const { FNPACK_KEY: key, FNPACK_CERT: cert } = process.env;
+  if (!args.includes("--nosign") && (key || cert)) {
+    if (!key || !cert) {
+      console.error("Set both FNPACK_KEY and FNPACK_CERT, or use the certificate already imported into fnpack.");
+      process.exit(1);
+    }
+    args.push("--key", key, "--cert", cert);
+  }
+}
+
+const result = spawnSync(fnpack, args, { cwd: root, encoding: "utf8", stdio: ["inherit", "pipe", "pipe"] });
+if (result.stdout) process.stdout.write(result.stdout);
+if (result.stderr) process.stderr.write(result.stderr);
+if (result.error) console.error(result.error.message);
+// fnpack can report a compression error with exit code zero.
+const packingFailed = args[0] === "build" && /Packing failed\./i.test(`${result.stdout}\n${result.stderr}`);
+process.exit(result.status == null || packingFailed ? 1 : result.status);
